@@ -20,7 +20,7 @@ Copy [.env.example](.env.example) for the variable names and set each in the new
 | --- | --- |
 | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | New Supabase project, server-side access only |
 | `TOKEN_ENCRYPTION_KEY` | 32 random bytes encoded as base64; encrypts the Google refresh token in `app_state` |
-| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` | New Google OAuth web client |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` | New Google OAuth web client; one client supports separate Gmail and Drive/Sheets sign-ins |
 | `GOOGLE_PUBSUB_TOPIC` | `projects/<new-project-id>/topics/<topic>` in the same Google project as the OAuth client |
 | `GOOGLE_PUBSUB_AUDIENCE`, `GOOGLE_PUBSUB_PUSH_SERVICE_ACCOUNT` | Exact `/api/pubsub` URL and identity of the authenticated Pub/Sub push subscription |
 | `GMAIL_ADDRESS` | `info@ellips.uz`; OAuth callback checks this mailbox |
@@ -37,7 +37,7 @@ Generate independent random values for `CRON_SECRET`, `SETUP_SECRET`, and `TELEG
 
 1. Create all new projects and verify the proposed Vercel name is unused among the team's projects. Run the SQL schema. Deploy this folder to the new Vercel project and set all environment variables. Check `GET /api/health` returns `{"ok":true}`.
 2. Create a Pub/Sub topic. Grant `gmail-api-push@system.gserviceaccount.com` the Pub/Sub Publisher role on the topic. Create a **push** subscription pointing to `https://<deployment>/api/pubsub`; enable authenticated push using the new push service account and set its audience to the same exact URL. Give the Pub/Sub service agent permission to mint OIDC tokens for that account.
-3. Request the one-time consent link with `POST /api/oauth/start` and `Authorization: Bearer <SETUP_SECRET>`. Open the returned URL in the client's browser and sign in as `info@ellips.uz`. The callback stores the refresh token encrypted in Supabase. The OAuth scopes are Gmail read-only, Drive file, and Sheets.
+3. Request the Gmail consent link with `POST /api/oauth/start`, JSON body `{"purpose":"gmail"}`, and `Authorization: Bearer <SETUP_SECRET>`. Open the returned URL and sign in as `info@ellips.uz`. Request a second link with `{"purpose":"archive"}` and sign in as the Google account that should own the Drive folder and Sheet. It may be a different account. Both refresh tokens are stored separately and encrypted in Supabase. The Gmail flow requests only Gmail read-only; the archive flow requests only Drive file and Sheets scopes.
 4. Run `node scripts/telegram-login.js` locally with the new Telegram API ID/hash, enter the client's phone, login code, and optional two-step password. Put the printed session in `TELEGRAM_STRING_SESSION` in Vercel, then clear the terminal history/output containing it.
 5. Register the new bot webhook: call Telegram `setWebhook` with URL `https://<deployment>/api/telegram` and `secret_token` equal to `TELEGRAM_WEBHOOK_SECRET`. Add the bot as an admin of the new email group. Set `TELEGRAM_EMAIL_CHAT_ID` to that group's ID.
 6. Invoke `GET /api/cron/watch` with `Authorization: Bearer <CRON_SECRET>` once after OAuth. Confirm `app_state.gmail_watch_expiration` is later than the current time. Vercel renews the watch daily.

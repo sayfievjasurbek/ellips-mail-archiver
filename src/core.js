@@ -5,11 +5,10 @@ import { google } from 'googleapis';
 import { TelegramClient, utils } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 
-export const scopes = [
-  'https://www.googleapis.com/auth/gmail.readonly',
-  'https://www.googleapis.com/auth/drive.file',
-  'https://www.googleapis.com/auth/spreadsheets'
-];
+export const oauthScopes = {
+  gmail: ['https://www.googleapis.com/auth/gmail.readonly'],
+  archive: ['https://www.googleapis.com/auth/drive.file', 'https://www.googleapis.com/auth/spreadsheets']
+};
 export const env = key => { const value = process.env[key]; if (!value) throw new Error(`Missing ${key}`); return value; };
 const boundedFetch = (input, options = {}) => fetch(input, {
   ...options,
@@ -47,9 +46,10 @@ export function decrypt(text) {
   return Buffer.concat([decipher.update(raw.subarray(28)), decipher.final()]).toString('utf8');
 }
 export function oauth() { return new google.auth.OAuth2(env('GOOGLE_CLIENT_ID'), env('GOOGLE_CLIENT_SECRET'), env('GOOGLE_REDIRECT_URI')); }
-export async function googleAuth() {
-  const refresh = await state('google_refresh_token');
-  if (!refresh) throw new Error('Google OAuth not connected');
+export async function googleAuth(purpose) {
+  if (!(purpose in oauthScopes)) throw new Error('Invalid Google OAuth purpose');
+  const refresh = await state(`${purpose}_refresh_token`);
+  if (!refresh) throw new Error(`${purpose} Google OAuth not connected`);
   const auth = oauth(); auth.setCredentials({ refresh_token: decrypt(refresh) }); return auth;
 }
 export const b64 = value => Buffer.from(value.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
@@ -117,7 +117,7 @@ export async function forwardMessage(gmail, id) {
 export async function syncGmail() {
   if (!await claimJob('lock:gmail')) return { locked: true };
   try {
-    const gmail = google.gmail({ version: 'v1', auth: await googleAuth() });
+    const gmail = google.gmail({ version: 'v1', auth: await googleAuth('gmail') });
     let cursor = await state('gmail_history_id');
     if (!cursor) throw new Error('Gmail watch not initialized');
     let pageToken, count = 0, latest = cursor;
@@ -147,7 +147,7 @@ export async function syncGmail() {
   } finally { await setState('lock:gmail', new Date(0).toISOString()); }
 }
 export async function renewWatch() {
-  const gmail = google.gmail({ version: 'v1', auth: await googleAuth() });
+  const gmail = google.gmail({ version: 'v1', auth: await googleAuth('gmail') });
   const { data } = await gmail.users.watch({ userId: 'me', requestBody: { topicName: env('GOOGLE_PUBSUB_TOPIC') } });
   if (!await state('gmail_history_id')) await setState('gmail_history_id', data.historyId);
   if (!await state('gmail_last_sync_unix')) await setState('gmail_last_sync_unix', Math.floor(Date.now() / 1000));
@@ -278,7 +278,7 @@ export async function pollArchive({ budgetMs = ARCHIVE_RUN_BUDGET_MS } = {}) {
   try {
     const chats = ok(await db().from('archived_chats').select('*').eq('active', true).order('added_at'));
     if (!chats.length) return { chats: 0 };
-    client = await userbot(); const auth = await googleAuth(); const results = [];
+    client = await userbot(); const auth = await googleAuth('archive'); const results = [];
     const dialogs = await client.getDialogs({ limit: 500 });
     const ordered = rotateChats(chats, await state('archive_next_chat_id'));
     for (const [index, chat] of ordered.entries()) {

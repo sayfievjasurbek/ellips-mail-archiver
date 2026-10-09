@@ -3,7 +3,7 @@ import { OAuth2Client } from 'google-auth-library';
 import { google } from 'googleapis';
 import { utils } from 'telegram';
 import { waitUntil } from '@vercel/functions';
-import { db, env, ok, state, setState, log, oauth, scopes, encrypt, renewWatch, syncGmail, pollArchive, telegramBot, userbot } from '../src/core.js';
+import { db, env, ok, state, setState, log, oauth, oauthScopes, encrypt, renewWatch, syncGmail, pollArchive, telegramBot, userbot } from '../src/core.js';
 
 const reply = (res, code, body) => res.status(code).json(body);
 const authorized = (req, secret) => Boolean(secret) && req.headers.authorization === `Bearer ${secret}`;
@@ -81,21 +81,28 @@ export default async function handler(req, res) {
     if (path === '/api/health' && req.method === 'GET') return reply(res, 200, { ok: true });
     if (path === '/api/oauth/start' && req.method === 'POST') {
       if (!authorized(req, process.env.SETUP_SECRET)) return reply(res, 401, { error: 'Unauthorized' });
+      const purpose = req.body?.purpose;
+      if (!Object.hasOwn(oauthScopes, purpose)) return reply(res, 400, { error: 'purpose must be gmail or archive' });
       const nonce = crypto.randomBytes(24).toString('hex');
-      await setState('oauth_nonce', nonce);
-      return reply(res, 200, { url: oauth().generateAuthUrl({ access_type: 'offline', prompt: 'consent', scope: scopes, state: nonce }) });
+      await setState(`oauth_nonce_${purpose}`, nonce);
+      return reply(res, 200, { purpose, url: oauth().generateAuthUrl({ access_type: 'offline', prompt: 'consent select_account', scope: oauthScopes[purpose], state: `${purpose}.${nonce}` }) });
     }
     if (path === '/api/oauth/callback' && req.method === 'GET') {
-      if (!req.query?.code || req.query.state !== await state('oauth_nonce')) return reply(res, 403, { error: 'Invalid OAuth state' });
-      await setState('oauth_nonce', 'used');
+      const [purpose, nonce] = String(req.query?.state || '').split('.');
+      if (!Object.hasOwn(oauthScopes, purpose) || !req.query?.code || !nonce || nonce !== await state(`oauth_nonce_${purpose}`)) return reply(res, 403, { error: 'Invalid OAuth state' });
+      await setState(`oauth_nonce_${purpose}`, 'used');
       const auth = oauth(); const { tokens } = await auth.getToken(req.query.code);
       if (!tokens.refresh_token) throw new Error('Google did not return a refresh token');
       auth.setCredentials(tokens);
-      const profile = (await google.gmail({ version: 'v1', auth }).users.getProfile({ userId: 'me' })).data;
-      if (profile.emailAddress?.toLowerCase() !== env('GMAIL_ADDRESS').toLowerCase()) throw new Error('Signed into the wrong Google account');
-      await setState('google_refresh_token', encrypt(tokens.refresh_token));
-      await log('oauth_connect', 'success', profile.emailAddress);
-      return res.status(200).send('Google account connected. You can close this tab.');
+      const account = purpose === 'gmail'
+        ? (await google.gmail({ version: 'v1', auth }).users.getProfile({ userId: 'me' })).data.emailAddress
+        : (await google.drive({ version: 'v3', auth }).about.get({ fields: 'user(emailAddress)' })).data.user?.emailAddress;
+      if (!account) throw new Error('Could not identify Google account');
+      if (purpose === 'gmail' && account.toLowerCase() !== env('GMAIL_ADDRESS').toLowerCase()) throw new Error('Signed into the wrong Gmail account');
+      await setState(`${purpose}_refresh_token`, encrypt(tokens.refresh_token));
+      await setState(`${purpose}_account_email`, account);
+      await log('oauth_connect', 'success', account, { purpose });
+      return res.status(200).send(`${purpose === 'gmail' ? 'Gmail' : 'Drive and Sheets'} connected as ${account}. You can close this tab.`);
     }
     if (path === '/api/pubsub' && req.method === 'POST') {
       await verifyPubsub(req);
