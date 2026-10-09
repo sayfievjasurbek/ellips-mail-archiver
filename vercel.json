@@ -1,9 +1,5 @@
 {
-  "functions": {"api/index.js": {"maxDuration": 300}},
+  "functions": {"api/index.js": {"maxDuration": 60}},
   "rewrites": [{"source": "/api/:path*", "destination": "/api/index.js"}],
-  "crons": [
-    {"path": "/api/cron/watch", "schedule": "0 2 * * *"},
-    {"path": "/api/cron/archive", "schedule": "*/10 * * * *"},
-    {"path": "/api/cron/gmail", "schedule": "*/5 * * * *"}
-  ]
+  "crons": [{"path": "/api/cron/watch", "schedule": "0 2 * * *"}]
 }

@@ -2,11 +2,18 @@ import crypto from 'node:crypto';
 import { OAuth2Client } from 'google-auth-library';
 import { google } from 'googleapis';
 import { utils } from 'telegram';
+import { waitUntil } from '@vercel/functions';
 import { db, env, ok, state, setState, log, oauth, scopes, encrypt, renewWatch, syncGmail, pollArchive, telegramBot, userbot } from '../src/core.js';
 
 const reply = (res, code, body) => res.status(code).json(body);
 const authorized = (req, secret) => Boolean(secret) && req.headers.authorization === `Bearer ${secret}`;
-const text = value => String(value || '').trim();
+export const schedulerAuthorized = (req, secret) => {
+  const supplied = req.headers['x-cron-secret'];
+  if (!secret || typeof supplied !== 'string') return false;
+  const expectedHash = crypto.createHash('sha256').update(secret).digest();
+  const suppliedHash = crypto.createHash('sha256').update(supplied).digest();
+  return crypto.timingSafeEqual(expectedHash, suppliedHash);
+};
 
 async function botCommand(req) {
   if (req.headers['x-telegram-bot-api-secret-token'] !== env('TELEGRAM_WEBHOOK_SECRET')) throw new Error('Unauthorized Telegram webhook');
@@ -95,11 +102,16 @@ export default async function handler(req, res) {
       return reply(res, 200, await syncGmail());
     }
     if (path === '/api/telegram' && req.method === 'POST') return reply(res, 200, await botCommand(req));
+    if (path === '/api/poll/archive' && req.method === 'GET') {
+      if (!schedulerAuthorized(req, process.env.CRON_SECRET)) return reply(res, 401, { error: 'Unauthorized' });
+      waitUntil(pollArchive().catch(async error => {
+        await log('archive_poll', 'failure', 'scheduler', { error: String(error) });
+      }));
+      return reply(res, 202, { accepted: true });
+    }
     if (path.startsWith('/api/cron/') && req.method === 'GET') {
       if (!authorized(req, process.env.CRON_SECRET)) return reply(res, 401, { error: 'Unauthorized' });
       if (path === '/api/cron/watch') return reply(res, 200, await renewWatch());
-      if (path === '/api/cron/archive') return reply(res, 200, await pollArchive());
-      if (path === '/api/cron/gmail') return reply(res, 200, await syncGmail());
     }
     return reply(res, 404, { error: 'Not found' });
   } catch (error) {

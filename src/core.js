@@ -2,7 +2,6 @@ import crypto from 'node:crypto';
 import { Readable } from 'node:stream';
 import { createClient } from '@supabase/supabase-js';
 import { google } from 'googleapis';
-import { OAuth2Client } from 'google-auth-library';
 import { TelegramClient, utils } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 
@@ -12,12 +11,28 @@ export const scopes = [
   'https://www.googleapis.com/auth/spreadsheets'
 ];
 export const env = key => { const value = process.env[key]; if (!value) throw new Error(`Missing ${key}`); return value; };
-export const db = () => createClient(env('SUPABASE_URL'), env('SUPABASE_SERVICE_ROLE_KEY'), { auth: { persistSession: false } });
+const boundedFetch = (input, options = {}) => fetch(input, {
+  ...options,
+  signal: options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(8_000)]) : AbortSignal.timeout(8_000)
+});
+export const db = () => createClient(env('SUPABASE_URL'), env('SUPABASE_SERVICE_ROLE_KEY'), { auth: { persistSession: false }, global: { fetch: boundedFetch } });
 export const ok = (result) => { if (result.error) throw result.error; return result.data; };
 export const state = async key => (ok(await db().from('app_state').select('value').eq('key', key).maybeSingle()))?.value;
 export const setState = async (key, value) => ok(await db().from('app_state').upsert({ key, value: String(value), updated_at: new Date().toISOString() }));
 export const log = async (action, status, source_id, details = {}) => ok(await db().from('message_log').insert({ action, status, source_id: String(source_id || ''), details }));
 export const claimJob = async (key, seconds = 600) => ok(await db().rpc('claim_job', { p_key: key, p_seconds: seconds }));
+export const ARCHIVE_RUN_BUDGET_MS = 38_000;
+export const ARCHIVE_MIN_START_MS = 18_000;
+export const hasArchiveTime = (deadline, minimum = 0) => Date.now() + minimum < deadline;
+export function rotateChats(chats, nextChatId) {
+  const index = chats.findIndex(chat => chat.chat_id === nextChatId);
+  return index < 0 ? chats : [...chats.slice(index), ...chats.slice(0, index)];
+}
+function googleTimeout(deadline, maximum = 10_000) {
+  const remaining = deadline - Date.now();
+  if (remaining <= 1_000) throw new Error('Archive run time budget reached');
+  return { timeout: Math.min(maximum, remaining - 500) };
+}
 
 function cipherKey() { return Buffer.from(env('TOKEN_ENCRYPTION_KEY'), 'base64'); }
 export function encrypt(text) {
@@ -155,79 +170,91 @@ export function mediaInfo(message) {
   return { kind, name, mime: file.mimeType || 'application/octet-stream', size: Number(file.size || 0), unique: String(message.media?.document?.id || message.media?.photo?.id || message.id) };
 }
 const quote = value => String(value).replace(/'/g, "\\'");
-async function ensureDriveFolder(drive, name, parent) {
+async function ensureDriveFolder(drive, name, parent, deadline) {
   const q = `name = '${quote(name)}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false${parent ? ` and '${parent}' in parents` : ''}`;
-  const found = (await drive.files.list({ q, fields: 'files(id,name)', pageSize: 10 })).data.files?.[0];
+  const found = (await drive.files.list({ q, fields: 'files(id,name)', pageSize: 10 }, googleTimeout(deadline))).data.files?.[0];
   if (found) return found.id;
-  return (await drive.files.create({ requestBody: { name, mimeType: 'application/vnd.google-apps.folder', ...(parent ? { parents: [parent] } : {}) }, fields: 'id' })).data.id;
+  return (await drive.files.create({ requestBody: { name, mimeType: 'application/vnd.google-apps.folder', ...(parent ? { parents: [parent] } : {}) }, fields: 'id' }, googleTimeout(deadline))).data.id;
 }
-async function ensureResources(auth, chat) {
+async function ensureResources(auth, chat, deadline) {
   const drive = google.drive({ version: 'v3', auth }), sheets = google.sheets({ version: 'v4', auth });
   let root = await state('drive_root_id');
-  if (!root) { root = await ensureDriveFolder(drive, 'Telegram Files'); await setState('drive_root_id', root); }
+  if (!root) { root = await ensureDriveFolder(drive, 'Telegram Files', null, deadline); await setState('drive_root_id', root); }
   let spreadsheetId = await state('spreadsheet_id');
   if (!spreadsheetId) {
-    const created = await sheets.spreadsheets.create({ requestBody: { properties: { title: 'Telegram Archive' } }, fields: 'spreadsheetId' });
+    const created = await sheets.spreadsheets.create({ requestBody: { properties: { title: 'Telegram Archive' } }, fields: 'spreadsheetId' }, googleTimeout(deadline));
     spreadsheetId = created.data.spreadsheetId; await setState('spreadsheet_id', spreadsheetId);
   }
   let folder = chat.drive_folder_id;
-  if (!folder) { folder = await ensureDriveFolder(drive, chat.title, root); ok(await db().from('archived_chats').update({ drive_folder_id: folder }).eq('chat_id', chat.chat_id)); }
+  if (!folder) { folder = await ensureDriveFolder(drive, chat.title, root, deadline); ok(await db().from('archived_chats').update({ drive_folder_id: folder }).eq('chat_id', chat.chat_id)); }
   let tab = chat.sheet_tab_id;
   if (tab == null) {
     const title = chat.title.slice(0, 90).replace(/[\[\]:*?/\\]/g, '_') || chat.chat_id;
     const tabTitle = `${title} ${chat.chat_id}`.slice(0, 100);
-    const existing = (await sheets.spreadsheets.get({ spreadsheetId, fields: 'sheets(properties(sheetId,title))' })).data.sheets.find(s => s.properties.title === tabTitle);
+    const existing = (await sheets.spreadsheets.get({ spreadsheetId, fields: 'sheets(properties(sheetId,title))' }, googleTimeout(deadline))).data.sheets.find(s => s.properties.title === tabTitle);
     if (existing) tab = existing.properties.sheetId;
     else {
-      const result = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [{ addSheet: { properties: { title: tabTitle, gridProperties: { frozenRowCount: 1 } } } }] } });
+      const result = await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [{ addSheet: { properties: { title: tabTitle, gridProperties: { frozenRowCount: 1 } } } }] } }, googleTimeout(deadline));
       tab = result.data.replies[0].addSheet.properties.sheetId;
     }
-    await sheets.spreadsheets.values.update({ spreadsheetId, range: `'${tabTitle.replace(/'/g, "''")}'!A1:G1`, valueInputOption: 'RAW', requestBody: { values: [['Дата', 'Отправитель', 'Имя файла', 'Тип', 'Размер', 'Ссылка на Drive', 'Ссылка на сообщение']] } });
-    await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [{ repeatCell: { range: { sheetId: tab, startRowIndex: 0, endRowIndex: 1 }, cell: { userEnteredFormat: { textFormat: { bold: true } } }, fields: 'userEnteredFormat.textFormat.bold' } }] } });
+    await sheets.spreadsheets.values.update({ spreadsheetId, range: `'${tabTitle.replace(/'/g, "''")}'!A1:G1`, valueInputOption: 'RAW', requestBody: { values: [['Дата', 'Отправитель', 'Имя файла', 'Тип', 'Размер', 'Ссылка на Drive', 'Ссылка на сообщение']] } }, googleTimeout(deadline));
+    await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [{ repeatCell: { range: { sheetId: tab, startRowIndex: 0, endRowIndex: 1 }, cell: { userEnteredFormat: { textFormat: { bold: true } } }, fields: 'userEnteredFormat.textFormat.bold' } }] } }, googleTimeout(deadline));
     ok(await db().from('archived_chats').update({ sheet_tab_id: tab }).eq('chat_id', chat.chat_id));
   }
   return { drive, sheets, root, folder, spreadsheetId, tab };
 }
-export async function archiveChat(client, auth, chat, limit = 30) {
-  const dialogs = await client.getDialogs({ limit: 500 });
+export async function archiveChat(client, auth, chat, dialogs, deadline, limit = 15) {
   const peer = chat.username ? await client.getEntity(`@${chat.username}`) : dialogs.find(d => String(utils.getPeerId(d.entity)) === chat.chat_id)?.entity;
   if (!peer) throw new Error('Chat is not in the user account’s recent dialogs');
-  let count = 0, last = Number(chat.last_message_id || 0);
+  let count = 0, processed = 0, last = Number(chat.last_message_id || 0), paused = false;
   for await (const message of client.iterMessages(peer, { minId: last, reverse: true, limit })) {
+    if (!hasArchiveTime(deadline, ARCHIVE_MIN_START_MS)) { paused = true; break; }
     const info = mediaInfo(message);
     if (info) {
       const claimed = ok(await db().rpc('claim_file', { p_chat: chat.chat_id, p_message: message.id, p_unique: info.unique }));
+      if (!claimed) {
+        const existing = ok(await db().from('archived_files').select('status').eq('chat_id', chat.chat_id).eq('message_id', message.id).single());
+        if (existing.status !== 'done' && existing.status !== 'skipped') { paused = true; break; }
+      }
       if (claimed) {
         try {
-          if (info.size > 50 * 1024 * 1024) throw new Error('File exceeds 50 MB serverless processing limit');
-          const resources = await ensureResources(auth, chat);
+          if (info.size > 50 * 1024 * 1024) {
+            ok(await db().from('archived_files').update({ status: 'skipped', error: 'File exceeds 50 MB serverless processing limit', lease_until: null }).eq('chat_id', chat.chat_id).eq('message_id', message.id));
+            await log('file_archive', 'skipped', `${chat.chat_id}:${message.id}`, { size: info.size });
+            last = message.id; processed++;
+            ok(await db().from('archived_chats').update({ last_message_id: last }).eq('chat_id', chat.chat_id));
+            continue;
+          }
+          const resources = await ensureResources(auth, chat, deadline);
           const previous = ok(await db().from('archived_files').select('drive_file_id').eq('chat_id', chat.chat_id).eq('message_id', message.id).single());
           let fileId = previous.drive_file_id, filename = info.name, bytes = info.size;
           if (!fileId) {
-            const downloaded = await client.downloadMedia(message.media, {});
+            const downloaded = await client.downloadMedia(message.media, { progressCallback: () => {
+              if (!hasArchiveTime(deadline, 2_000)) throw new Error('Archive run time budget reached');
+            } });
             if (!Buffer.isBuffer(downloaded)) throw new Error('Telegram media download failed');
             bytes = downloaded.length;
             const q = `'${resources.folder}' in parents and trashed = false`;
-            const existingFiles = (await resources.drive.files.list({ q, fields: 'nextPageToken,files(id,name,description)', pageSize: 1000 })).data.files || [];
+            const existingFiles = (await resources.drive.files.list({ q, fields: 'nextPageToken,files(id,name,description)', pageSize: 1000 }, googleTimeout(deadline))).data.files || [];
             const earlier = existingFiles.find(f => f.description === `Telegram ${chat.chat_id}:${message.id}`);
             if (earlier) { fileId = earlier.id; filename = earlier.name; }
             else {
               filename = existingFiles.some(f => f.name === info.name) ? `${info.name.replace(/(\.[^.]+)?$/, '')}-${message.id}${info.name.match(/\.[^.]+$/)?.[0] || ''}` : info.name;
-              const upload = await resources.drive.files.create({ requestBody: { name: filename, parents: [resources.folder], description: `Telegram ${chat.chat_id}:${message.id}` }, media: { mimeType: info.mime, body: Readable.from(downloaded) }, fields: 'id' });
+              const upload = await resources.drive.files.create({ requestBody: { name: filename, parents: [resources.folder], description: `Telegram ${chat.chat_id}:${message.id}` }, media: { mimeType: info.mime, body: Readable.from(downloaded) }, fields: 'id' }, googleTimeout(deadline, 30_000));
               fileId = upload.data.id;
             }
             ok(await db().from('archived_files').update({ drive_file_id: fileId }).eq('chat_id', chat.chat_id).eq('message_id', message.id));
           } else {
-            const existing = (await resources.drive.files.get({ fileId, fields: 'id,name,size' })).data;
+            const existing = (await resources.drive.files.get({ fileId, fields: 'id,name,size' }, googleTimeout(deadline))).data;
             filename = existing.name; bytes = Number(existing.size || bytes);
           }
           const sender = message.senderId ? String(message.senderId) : '';
           const link = chat.username ? `https://t.me/${chat.username}/${message.id}` : chat.chat_id.startsWith('-100') ? `https://t.me/c/${chat.chat_id.slice(4)}/${message.id}` : '';
-          const sheet = (await resources.sheets.spreadsheets.get({ spreadsheetId: resources.spreadsheetId, fields: 'sheets(properties(sheetId,title))' })).data.sheets.find(s => s.properties.sheetId === resources.tab);
+          const sheet = (await resources.sheets.spreadsheets.get({ spreadsheetId: resources.spreadsheetId, fields: 'sheets(properties(sheetId,title))' }, googleTimeout(deadline))).data.sheets.find(s => s.properties.sheetId === resources.tab);
           const sheetRange = `'${sheet.properties.title.replace(/'/g, "''")}'!A:G`;
-          const existingRows = (await resources.sheets.spreadsheets.values.get({ spreadsheetId: resources.spreadsheetId, range: sheetRange })).data.values || [];
+          const existingRows = (await resources.sheets.spreadsheets.values.get({ spreadsheetId: resources.spreadsheetId, range: sheetRange }, googleTimeout(deadline))).data.values || [];
           if (!existingRows.some(row => row[5] === `https://drive.google.com/file/d/${fileId}/view`)) {
-            await resources.sheets.spreadsheets.values.append({ spreadsheetId: resources.spreadsheetId, range: sheetRange, valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS', requestBody: { values: [[message.date?.toISOString?.() || '', sender, filename, info.kind, bytes, `https://drive.google.com/file/d/${fileId}/view`, link]] } });
+            await resources.sheets.spreadsheets.values.append({ spreadsheetId: resources.spreadsheetId, range: sheetRange, valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS', requestBody: { values: [[message.date?.toISOString?.() || '', sender, filename, info.kind, bytes, `https://drive.google.com/file/d/${fileId}/view`, link]] } }, googleTimeout(deadline));
           }
           ok(await db().from('archived_files').update({ status: 'done', drive_file_id: fileId, archived_at: new Date().toISOString(), lease_until: null }).eq('chat_id', chat.chat_id).eq('message_id', message.id));
           await log('file_archive', 'success', `${chat.chat_id}:${message.id}`, { fileId }); count++;
@@ -239,21 +266,27 @@ export async function archiveChat(client, auth, chat, limit = 30) {
       }
     }
     last = message.id;
+    processed++;
     ok(await db().from('archived_chats').update({ last_message_id: last }).eq('chat_id', chat.chat_id));
   }
-  return { archived: count, lastMessageId: last };
+  return { archived: count, processed, lastMessageId: last, paused };
 }
-export async function pollArchive() {
+export async function pollArchive({ budgetMs = ARCHIVE_RUN_BUDGET_MS } = {}) {
+  const deadline = Date.now() + budgetMs;
   if (!await claimJob('lock:archive')) return { locked: true };
   let client;
   try {
     const chats = ok(await db().from('archived_chats').select('*').eq('active', true).order('added_at'));
     if (!chats.length) return { chats: 0 };
     client = await userbot(); const auth = await googleAuth(); const results = [];
-    for (const chat of chats) {
-      try { results.push({ chat: chat.chat_id, ...await archiveChat(client, auth, chat) }); }
+    const dialogs = await client.getDialogs({ limit: 500 });
+    const ordered = rotateChats(chats, await state('archive_next_chat_id'));
+    for (const [index, chat] of ordered.entries()) {
+      if (!hasArchiveTime(deadline, ARCHIVE_MIN_START_MS)) break;
+      await setState('archive_next_chat_id', ordered[(index + 1) % ordered.length].chat_id);
+      try { results.push({ chat: chat.chat_id, ...await archiveChat(client, auth, chat, dialogs, deadline) }); }
       catch (error) { results.push({ chat: chat.chat_id, error: String(error) }); await log('chat_poll', 'failure', chat.chat_id, { error: String(error) }); }
     }
-    return { results };
+    return { results, paused: !hasArchiveTime(deadline, ARCHIVE_MIN_START_MS) };
   } finally { if (client) await client.disconnect(); await setState('lock:archive', new Date(0).toISOString()); }
 }
