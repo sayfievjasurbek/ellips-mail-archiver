@@ -6,7 +6,6 @@ import { TelegramClient, utils } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 
 export const oauthScopes = {
-  gmail: ['https://www.googleapis.com/auth/gmail.readonly'],
   archive: ['https://www.googleapis.com/auth/drive.file', 'https://www.googleapis.com/auth/spreadsheets']
 };
 export const env = key => { const value = process.env[key]; if (!value) throw new Error(`Missing ${key}`); return value; };
@@ -52,110 +51,20 @@ export async function googleAuth(purpose) {
   if (!refresh) throw new Error(`${purpose} Google OAuth not connected`);
   const auth = oauth(); auth.setCredentials({ refresh_token: decrypt(refresh) }); return auth;
 }
-export const b64 = value => Buffer.from(value.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
 export const truncate = (value, max = 3500) => value.length > max ? `${value.slice(0, max - 1)}…` : value;
 export const stripHtml = html => html.replace(/<\s*(br|\/p|\/div|\/li)\b[^>]*>/gi, '\n').replace(/<[^>]*>/g, ' ')
   .replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
   .replace(/&quot;/gi, '"').replace(/&#39;/gi, "'").replace(/[ \t]+/g, ' ').replace(/\n[ \t]+/g, '\n').trim();
-export function emailParts(root) {
-  const parts = []; const walk = p => { if (p.parts?.length) p.parts.forEach(walk); else parts.push(p); }; walk(root || {});
-  const body = parts.find(p => p.mimeType === 'text/plain' && p.body?.data) || parts.find(p => p.mimeType === 'text/html' && p.body?.data);
-  const value = body ? b64(body.body.data).toString('utf8') : '';
-  return { text: body?.mimeType === 'text/html' ? stripHtml(value) : value, attachments: parts.filter(p => p.filename && (p.body?.attachmentId || p.body?.data)) };
-}
 export function safeName(name) { return (name || 'file').replace(/[\\/\x00-\x1f]/g, '_').slice(0, 180); }
 
-export async function telegramBot(method, params = {}, file) {
+export async function telegramBot(method, params = {}, file, signal) {
   const form = new FormData();
   for (const [key, value] of Object.entries(params)) form.set(key, String(value));
   if (file) form.set(file.field, new Blob([file.bytes], { type: file.mime || 'application/octet-stream' }), safeName(file.name));
-  const response = await fetch(`https://api.telegram.org/bot${env('TELEGRAM_BOT_TOKEN')}/${method}`, { method: 'POST', body: form });
+  const response = await fetch(`https://api.telegram.org/bot${env('TELEGRAM_BOT_TOKEN')}/${method}`, { method: 'POST', body: form, signal });
   const result = await response.json(); if (!result.ok) throw new Error(`Telegram ${method}: ${result.description || response.status}`);
   return result.result;
 }
-export async function forwardMessage(gmail, id) {
-  const message = (await gmail.users.messages.get({ userId: 'me', id, format: 'full' })).data;
-  const labels = message.labelIds || [];
-  if (!labels.includes('INBOX') || labels.includes('SENT') || labels.includes('DRAFT')) return 'skipped';
-  const claimed = ok(await db().rpc('claim_email', { p_id: id, p_thread: message.threadId }));
-  if (!claimed) return 'duplicate';
-  try {
-    const row = ok(await db().from('forwarded_emails').select('sent_steps').eq('gmail_message_id', id).single());
-    const sent = new Set(row.sent_steps || []);
-    const mark = async step => {
-      sent.add(step);
-      ok(await db().from('forwarded_emails').update({ sent_steps: [...sent] }).eq('gmail_message_id', id));
-    };
-    const headers = Object.fromEntries((message.payload?.headers || []).map(x => [x.name.toLowerCase(), x.value]));
-    const { text, attachments } = emailParts(message.payload);
-    const summary = `From: ${headers.from || ''}\nSubject: ${headers.subject || '(no subject)'}\nDate: ${headers.date || ''}\n\n${truncate(text || '(no text body)')}`;
-    if (!sent.has('body')) { await telegramBot('sendMessage', { chat_id: env('TELEGRAM_EMAIL_CHAT_ID'), text: summary }); await mark('body'); }
-    for (const [index, part] of attachments.entries()) {
-      const step = `attachment:${index}`;
-      if (sent.has(step)) continue;
-      if (Number(part.body.size || 0) > 50 * 1024 * 1024) {
-        await telegramBot('sendMessage', { chat_id: env('TELEGRAM_EMAIL_CHAT_ID'), text: `Attachment too large to forward: ${safeName(part.filename)} (${(part.body.size / 1048576).toFixed(1)} MB)` });
-        await mark(step); continue;
-      }
-      const bytes = part.body.data ? b64(part.body.data) : b64((await gmail.users.messages.attachments.get({ userId: 'me', messageId: id, id: part.body.attachmentId })).data.data);
-      if (bytes.length > 50 * 1024 * 1024) {
-        await telegramBot('sendMessage', { chat_id: env('TELEGRAM_EMAIL_CHAT_ID'), text: `Attachment too large to forward: ${safeName(part.filename)} (${(bytes.length / 1048576).toFixed(1)} MB)` });
-      } else {
-        const photo = part.mimeType?.startsWith('image/') && bytes.length < 10 * 1024 * 1024;
-        await telegramBot(photo ? 'sendPhoto' : 'sendDocument', { chat_id: env('TELEGRAM_EMAIL_CHAT_ID'), ...(photo ? { caption: safeName(part.filename) } : {}) }, { field: photo ? 'photo' : 'document', bytes, name: part.filename, mime: part.mimeType });
-      }
-      await mark(step);
-    }
-    ok(await db().from('forwarded_emails').update({ status: 'done', forwarded_at: new Date().toISOString(), lease_until: null }).eq('gmail_message_id', id));
-    await log('email_forward', 'success', id, { attachments: attachments.length });
-    return 'forwarded';
-  } catch (error) {
-    await db().from('forwarded_emails').update({ status: 'failed', error: String(error), lease_until: null }).eq('gmail_message_id', id);
-    await log('email_forward', 'failure', id, { error: String(error) }); throw error;
-  }
-}
-export async function syncGmail() {
-  if (!await claimJob('lock:gmail')) return { locked: true };
-  try {
-    const gmail = google.gmail({ version: 'v1', auth: await googleAuth('gmail') });
-    let cursor = await state('gmail_history_id');
-    if (!cursor) throw new Error('Gmail watch not initialized');
-    let pageToken, count = 0, latest = cursor;
-    try {
-      do {
-        const { data } = await gmail.users.history.list({ userId: 'me', startHistoryId: cursor, historyTypes: ['messageAdded'], pageToken, maxResults: 100 });
-        const ids = [...new Set((data.history || []).flatMap(h => (h.messagesAdded || []).map(x => x.message?.id).filter(Boolean)))];
-        for (const id of ids) { const result = await forwardMessage(gmail, id); if (result === 'forwarded') count++; }
-        pageToken = data.nextPageToken; latest = data.historyId || latest;
-      } while (pageToken);
-    } catch (error) {
-      if (error.code !== 404 && error.status !== 404) throw error;
-      const after = await state('gmail_last_sync_unix');
-      if (!after) throw new Error('Gmail history expired and no recovery checkpoint exists');
-      let next;
-      do {
-        const { data } = await gmail.users.messages.list({ userId: 'me', q: `in:inbox after:${Math.max(0, Number(after) - 86400)}`, maxResults: 100, pageToken: next });
-        for (const item of data.messages || []) { const result = await forwardMessage(gmail, item.id); if (result === 'forwarded') count++; }
-        next = data.nextPageToken;
-      } while (next);
-      latest = (await gmail.users.getProfile({ userId: 'me' })).data.historyId;
-      await log('gmail_history_recovery', 'success', latest, { after });
-    }
-    await setState('gmail_history_id', latest);
-    await setState('gmail_last_sync_unix', Math.floor(Date.now() / 1000));
-    return { forwarded: count, historyId: latest };
-  } finally { await setState('lock:gmail', new Date(0).toISOString()); }
-}
-export async function renewWatch() {
-  const gmail = google.gmail({ version: 'v1', auth: await googleAuth('gmail') });
-  const { data } = await gmail.users.watch({ userId: 'me', requestBody: { topicName: env('GOOGLE_PUBSUB_TOPIC') } });
-  if (!await state('gmail_history_id')) await setState('gmail_history_id', data.historyId);
-  if (!await state('gmail_last_sync_unix')) await setState('gmail_last_sync_unix', Math.floor(Date.now() / 1000));
-  await setState('gmail_watch_expiration', data.expiration);
-  await log('watch_renew', 'success', data.historyId, { expiration: data.expiration });
-  return data;
-}
-
 export async function userbot() {
   const client = new TelegramClient(new StringSession(env('TELEGRAM_STRING_SESSION')), Number(env('TELEGRAM_API_ID')), env('TELEGRAM_API_HASH'), { connectionRetries: 2 });
   await client.connect(); if (!await client.isUserAuthorized()) throw new Error('Telegram user session expired');

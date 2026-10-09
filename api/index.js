@@ -1,9 +1,9 @@
 import crypto from 'node:crypto';
-import { OAuth2Client } from 'google-auth-library';
 import { google } from 'googleapis';
 import { utils } from 'telegram';
 import { waitUntil } from '@vercel/functions';
-import { db, env, ok, state, setState, log, oauth, oauthScopes, encrypt, renewWatch, syncGmail, pollArchive, telegramBot, userbot } from '../src/core.js';
+import { db, env, ok, state, setState, log, oauth, oauthScopes, encrypt, pollArchive, telegramBot, userbot } from '../src/core.js';
+import { pollImap } from '../src/imap.js';
 
 const reply = (res, code, body) => res.status(code).json(body);
 const authorized = (req, secret) => Boolean(secret) && req.headers.authorization === `Bearer ${secret}`;
@@ -62,19 +62,6 @@ async function botCommand(req) {
   return { ignored: true };
 }
 
-async function verifyPubsub(req) {
-  const token = String(req.headers.authorization || '').replace(/^Bearer /, '');
-  if (!token) throw new Error('Missing Pub/Sub OIDC token');
-  const verifier = new OAuth2Client();
-  const ticket = await verifier.verifyIdToken({ idToken: token, audience: env('GOOGLE_PUBSUB_AUDIENCE') });
-  if (ticket.getPayload()?.email !== env('GOOGLE_PUBSUB_PUSH_SERVICE_ACCOUNT')) throw new Error('Unexpected Pub/Sub service account');
-  const data = req.body?.message?.data;
-  if (!data) throw new Error('Missing Pub/Sub message');
-  const notification = JSON.parse(Buffer.from(data, 'base64').toString('utf8'));
-  if (notification.emailAddress?.toLowerCase() !== env('GMAIL_ADDRESS').toLowerCase()) throw new Error('Unexpected mailbox');
-  return notification;
-}
-
 export default async function handler(req, res) {
   const path = req.url.split('?')[0];
   try {
@@ -82,7 +69,7 @@ export default async function handler(req, res) {
     if (path === '/api/oauth/start' && req.method === 'POST') {
       if (!authorized(req, process.env.SETUP_SECRET)) return reply(res, 401, { error: 'Unauthorized' });
       const purpose = req.body?.purpose;
-      if (!Object.hasOwn(oauthScopes, purpose)) return reply(res, 400, { error: 'purpose must be gmail or archive' });
+      if (purpose !== 'archive') return reply(res, 400, { error: 'purpose must be archive' });
       const nonce = crypto.randomBytes(24).toString('hex');
       await setState(`oauth_nonce_${purpose}`, nonce);
       return reply(res, 200, { purpose, url: oauth().generateAuthUrl({ access_type: 'offline', prompt: 'consent select_account', scope: oauthScopes[purpose], state: `${purpose}.${nonce}` }) });
@@ -94,19 +81,12 @@ export default async function handler(req, res) {
       const auth = oauth(); const { tokens } = await auth.getToken(req.query.code);
       if (!tokens.refresh_token) throw new Error('Google did not return a refresh token');
       auth.setCredentials(tokens);
-      const account = purpose === 'gmail'
-        ? (await google.gmail({ version: 'v1', auth }).users.getProfile({ userId: 'me' })).data.emailAddress
-        : (await google.drive({ version: 'v3', auth }).about.get({ fields: 'user(emailAddress)' })).data.user?.emailAddress;
+      const account = (await google.drive({ version: 'v3', auth }).about.get({ fields: 'user(emailAddress)' })).data.user?.emailAddress;
       if (!account) throw new Error('Could not identify Google account');
-      if (purpose === 'gmail' && account.toLowerCase() !== env('GMAIL_ADDRESS').toLowerCase()) throw new Error('Signed into the wrong Gmail account');
       await setState(`${purpose}_refresh_token`, encrypt(tokens.refresh_token));
       await setState(`${purpose}_account_email`, account);
       await log('oauth_connect', 'success', account, { purpose });
-      return res.status(200).send(`${purpose === 'gmail' ? 'Gmail' : 'Drive and Sheets'} connected as ${account}. You can close this tab.`);
-    }
-    if (path === '/api/pubsub' && req.method === 'POST') {
-      await verifyPubsub(req);
-      return reply(res, 200, await syncGmail());
+      return res.status(200).send(`Drive and Sheets connected as ${account}. You can close this tab.`);
     }
     if (path === '/api/telegram' && req.method === 'POST') return reply(res, 200, await botCommand(req));
     if (path === '/api/poll/archive' && req.method === 'GET') {
@@ -116,9 +96,12 @@ export default async function handler(req, res) {
       }));
       return reply(res, 202, { accepted: true });
     }
-    if (path.startsWith('/api/cron/') && req.method === 'GET') {
-      if (!authorized(req, process.env.CRON_SECRET)) return reply(res, 401, { error: 'Unauthorized' });
-      if (path === '/api/cron/watch') return reply(res, 200, await renewWatch());
+    if (path === '/api/poll/email' && req.method === 'GET') {
+      if (!schedulerAuthorized(req, process.env.CRON_SECRET)) return reply(res, 401, { error: 'Unauthorized' });
+      waitUntil(pollImap().catch(async error => {
+        await log('imap_poll', 'failure', 'scheduler', { error: String(error) });
+      }));
+      return reply(res, 202, { accepted: true });
     }
     return reply(res, 404, { error: 'Not found' });
   } catch (error) {

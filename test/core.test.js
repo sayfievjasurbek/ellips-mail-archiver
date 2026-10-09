@@ -1,20 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { b64, emailParts, mediaInfo, safeName, stripHtml, truncate } from '../src/core.js';
+import { simpleParser } from 'mailparser';
+import { mediaInfo, safeName, stripHtml, truncate } from '../src/core.js';
+import { checkpointFor, messageKey } from '../src/imap.js';
 
-const encoded = value => Buffer.from(value).toString('base64url');
-test('email parsing prefers plain text and keeps attachments', () => {
-  const result = emailParts({ parts: [
-    { mimeType: 'text/html', body: { data: encoded('<p>HTML</p>') } },
-    { mimeType: 'text/plain', body: { data: encoded('Plain body') } },
-    { mimeType: 'application/pdf', filename: 'invoice.pdf', body: { attachmentId: 'a1', size: 12 } }
-  ] });
-  assert.equal(result.text, 'Plain body');
-  assert.equal(result.attachments[0].filename, 'invoice.pdf');
-});
 test('HTML fallback strips tags and decodes common entities', () => {
   assert.equal(stripHtml('<p>A &amp; B</p><div>C</div>'), 'A & B\nC');
-  assert.equal(emailParts({ mimeType: 'text/html', body: { data: encoded('<p>Hi</p>') } }).text, 'Hi');
 });
 test('media selection excludes stickers and text', () => {
   assert.equal(mediaInfo({ id: 1, message: 'hello' }), null);
@@ -25,5 +16,32 @@ test('media selection excludes stickers and text', () => {
 test('length and filename boundaries', () => {
   assert.equal(truncate('abcd', 3), 'ab…');
   assert.equal(safeName('a/b\\c'), 'a_b_c');
-  assert.equal(b64(encoded('value')).toString(), 'value');
+});
+
+test('IMAP baseline skips existing UIDs and resets on UIDVALIDITY change', () => {
+  assert.deepEqual(checkpointFor({ uidValidity: 42n, highestUid: 51 }, null), { uidValidity: '42', uid: 51, initialized: true });
+  assert.deepEqual(checkpointFor({ uidValidity: 42n, highestUid: 55 }, { uidValidity: '42', uid: 51 }), { uidValidity: '42', uid: 51, initialized: false });
+  assert.deepEqual(checkpointFor({ uidValidity: 43n, highestUid: 8 }, { uidValidity: '42', uid: 51 }), { uidValidity: '43', uid: 8, initialized: true });
+});
+
+test('Message-ID is the deduplication key, with UID fallback only if absent', () => {
+  assert.equal(messageKey('<one@example.com>', '42', 1), 'mid:one@example.com');
+  assert.equal(messageKey('<one@example.com>', '42', 2), 'mid:one@example.com');
+  assert.equal(messageKey('', '42', 2), 'uid:42:2');
+});
+
+test('MIME parser keeps Message-ID, plain body, and attachment filename', async () => {
+  const raw = [
+    'From: Sender <sender@example.com>', 'Subject: Report', 'Message-ID: <report@example.com>',
+    'MIME-Version: 1.0', 'Content-Type: multipart/mixed; boundary="boundary"', '',
+    '--boundary', 'Content-Type: text/plain; charset=utf-8', '', 'Plain body',
+    '--boundary', 'Content-Type: application/pdf; name="report.pdf"',
+    'Content-Disposition: attachment; filename="report.pdf"', 'Content-Transfer-Encoding: base64', '',
+    'UERG', '--boundary--', ''
+  ].join('\r\n');
+  const parsed = await simpleParser(raw);
+  assert.equal(messageKey(parsed.messageId, '1', 5), 'mid:report@example.com');
+  assert.equal(parsed.text.trim(), 'Plain body');
+  assert.equal(parsed.attachments[0].filename, 'report.pdf');
+  assert.equal(parsed.attachments[0].content.toString(), 'PDF');
 });
