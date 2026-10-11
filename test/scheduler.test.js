@@ -7,6 +7,7 @@ import { ARCHIVE_RUN_BUDGET_MS, hasArchiveTime, oauthScopes, rotateChats } from 
 test('Vercel Hobby has no internal crons', async () => {
   const config = JSON.parse(await readFile(new URL('../vercel.json', import.meta.url)));
   assert.equal(config.functions['api/index.js'].maxDuration, 60);
+  assert.deepEqual(config.functions['api/index.js'].regions, ['fra1']);
   assert.equal(config.crons, undefined);
 });
 

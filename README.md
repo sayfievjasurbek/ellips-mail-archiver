@@ -35,7 +35,7 @@ The first successful poll opens INBOX read-only, records the highest current UID
 
 The Telegram body includes From, Subject, Date, and up to about 3,500 characters of plain text or stripped HTML. Attachments up to 50 MB are forwarded with their filenames; images under 10 MB use `sendPhoto`. Oversized attachments get a note. Raw emails above 70 MB get a summary and size note because they cannot be parsed safely in a serverless function.
 
-If IMAP connection or login fails, the backend logs the error and posts a Telegram alert, throttled to one per hour. A new Yandex app password may take 2–3 hours to activate, so an early login failure is not evidence that the password is wrong.
+Each poll establishes one read-only IMAP session for fetching, then sends LOGOUT and disconnects. Connection setup has a 10-second limit and up to three sequential attempts with one- and two-second backoff; failed sockets are closed before retrying. Poll outcomes are logged even when no new mail exists. After three consecutive failed polls, the bot alerts with the actual last error; alerts are limited to one every six hours. A successful poll resets the failure streak. The API function runs in Vercel's `fra1` region.
 
 ## Telegram archive
 
@@ -48,4 +48,4 @@ Run `node scripts/telegram-login.js` locally when the client can provide the log
 3. Send a new email with a PDF and image, poll again, and confirm each file appears once in the group. Check `forwarded_emails` and `message_log`.
 4. Add a Telegram chat, poll the archive route, and check Drive and the Sheet. Post a new file and check the next poll.
 
-Each background batch targets 38 seconds within Vercel's 60-second function limit. A `202` means accepted, not completed. A crash after Telegram accepts a send but before the database step is recorded can result in that step being sent again on retry. Large backlogs require multiple polls.
+Each email batch targets 45 seconds within Vercel's 60-second function limit; archive batches target 38 seconds. A `202` means accepted, not completed. A crash after Telegram accepts a send but before the database step is recorded can result in that step being sent again on retry. Large backlogs require multiple polls.

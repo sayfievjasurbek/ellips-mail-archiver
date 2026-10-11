@@ -4,8 +4,11 @@ import { claimJob, db, env, log, ok, safeName, setState, state, stripHtml, teleg
 
 const MAX_SOURCE = 70 * 1024 * 1024;
 const MAX_FILE = 50 * 1024 * 1024;
-const RUN_BUDGET_MS = 38_000;
+const RUN_BUDGET_MS = 45_000;
 const BATCH_SIZE = 3;
+const CONNECT_TIMEOUT_MS = 10_000;
+const CONNECT_BACKOFF_MS = [1_000, 2_000];
+const ALERT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 const sendSignal = deadline => {
   const remaining = deadline - Date.now() - 1_000;
   if (remaining < 1_000) throw new Error('IMAP poll time budget reached');
@@ -26,6 +29,15 @@ export function checkpointFor(mailbox, saved) {
   }
   return { uidValidity, uid: Number(saved.uid), initialized: false };
 }
+
+export const shouldAlert = (failures, lastAlertAt, now = Date.now()) =>
+  failures >= 3 && now - Number(lastAlertAt || 0) >= ALERT_COOLDOWN_MS;
+
+const errorText = error => {
+  const password = process.env.IMAP_PASSWORD;
+  const value = String(error);
+  return password ? value.replaceAll(password, '[redacted]') : value;
+};
 
 async function markStep(id, sent, step) {
   sent.add(step);
@@ -71,34 +83,82 @@ export async function forwardImapMessage(message, uidValidity, uid, deadline = D
   }
 }
 
-async function alertLoginFailure(error) {
-  const previous = Number(await state('imap_login_alert_at') || 0);
-  if (Date.now() - previous < 60 * 60 * 1000) return;
-  const text = `IMAP connection or login failed for ${env('IMAP_USER')}. Mail forwarding is paused. A new Yandex app password may take 2–3 hours to activate. Check the Vercel logs; no password was changed.`;
-  try {
-    await telegramBot('sendMessage', { chat_id: env('TELEGRAM_EMAIL_CHAT_ID'), text }, undefined, AbortSignal.timeout(10_000));
-    await setState('imap_login_alert_at', Date.now());
-    await log('imap_login_alert', 'success', 'INBOX', { error: String(error) });
-  } catch (alertError) {
-    await log('imap_login_alert', 'failure', 'INBOX', { error: String(alertError) });
+async function openInboxWithRetries() {
+  const attempts = [];
+  for (let index = 0; index <= CONNECT_BACKOFF_MS.length; index++) {
+    const client = new ImapFlow({
+      host: env('IMAP_HOST'), port: Number(env('IMAP_PORT')), secure: true,
+      auth: { user: env('IMAP_USER'), pass: env('IMAP_PASSWORD') },
+      logger: false, disableAutoIdle: true,
+      connectionTimeout: CONNECT_TIMEOUT_MS, greetingTimeout: CONNECT_TIMEOUT_MS, socketTimeout: 15_000
+    });
+    client.on('error', () => {});
+    let timer;
+    try {
+      const opened = (async () => {
+        await client.connect();
+        return client.getMailboxLock('INBOX', { readOnly: true });
+      })();
+      const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          client.close();
+          reject(new Error(`IMAP connection timed out after ${CONNECT_TIMEOUT_MS / 1000} seconds`));
+        }, CONNECT_TIMEOUT_MS);
+      });
+      const lock = await Promise.race([opened, timeout]);
+      clearTimeout(timer);
+      return { client, lock, attempts };
+    } catch (error) {
+      clearTimeout(timer);
+      client.close();
+      const message = errorText(error);
+      attempts.push(message);
+      try { await log('imap_connect_attempt', 'failure', 'INBOX', { attempt: index + 1, error: message }); } catch {}
+      const authenticationRejected = error.serverResponseCode === 'AUTHENTICATIONFAILED' || /AUTHENTICATIONFAILED/i.test(message);
+      if (authenticationRejected || index === CONNECT_BACKOFF_MS.length) {
+        error.attemptErrors = attempts;
+        throw error;
+      }
+      await new Promise(resolve => setTimeout(resolve, CONNECT_BACKOFF_MS[index]));
+    }
   }
 }
 
-export async function pollImap() {
-  if (!await claimJob('lock:imap', 90)) return { locked: true };
-  const deadline = Date.now() + RUN_BUDGET_MS;
-  const client = new ImapFlow({
-    host: env('IMAP_HOST'), port: Number(env('IMAP_PORT')), secure: true,
-    auth: { user: env('IMAP_USER'), pass: env('IMAP_PASSWORD') },
-    logger: false, connectionTimeout: 10_000, greetingTimeout: 10_000, socketTimeout: 30_000
-  });
-  client.on('error', () => {});
-  let lock;
+async function closeInbox(client, lock) {
+  if (lock) lock.release();
+  if (!client) return;
+  let timer;
   try {
-    try { await client.connect(); }
-    catch (error) { await log('imap_login', 'failure', 'INBOX', { error: String(error) }); await alertLoginFailure(error); throw error; }
-    lock = await client.getMailboxLock('INBOX', { readOnly: true });
-    const savedText = await state('imap_checkpoint');
+    await Promise.race([
+      client.logout(),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('IMAP logout timed out')), 5_000); })
+    ]);
+  } catch (error) {
+    client.close();
+    try { await log('imap_logout', 'failure', 'INBOX', { error: errorText(error) }); } catch {}
+    throw error;
+  } finally { clearTimeout(timer); }
+}
+
+async function recordPollFailure(error) {
+  const message = errorText(error);
+  const failures = Number(await state('imap_failure_streak') || 0) + 1;
+  await setState('imap_failure_streak', failures);
+  await log('imap_poll', 'failure', 'INBOX', { error: message, consecutiveFailures: failures, connectAttempts: error.attemptErrors || [] });
+  const lastAlertAt = await state('imap_login_alert_at');
+  if (!shouldAlert(failures, lastAlertAt)) return;
+  const alert = `IMAP poll failed ${failures} consecutive times for ${env('IMAP_USER')}. Latest error: ${truncate(message, 650)}. Forwarding will retry; the UID checkpoint is preserved.`;
+  try {
+    await telegramBot('sendMessage', { chat_id: env('TELEGRAM_EMAIL_CHAT_ID'), text: alert }, undefined, AbortSignal.timeout(10_000));
+    await setState('imap_login_alert_at', Date.now());
+    await log('imap_poll_alert', 'success', 'INBOX', { error: message, consecutiveFailures: failures });
+  } catch (alertError) {
+    try { await log('imap_poll_alert', 'failure', 'INBOX', { error: errorText(alertError) }); } catch {}
+  }
+}
+
+async function processInbox(client, deadline) {
+  const savedText = await state('imap_checkpoint');
     const saved = savedText ? JSON.parse(savedText) : null;
     const latest = !saved ? await client.fetchOne('*', { uid: true }) : null;
     const checkpoint = checkpointFor({ ...client.mailbox, highestUid: latest?.uid || 0 }, saved);
@@ -109,14 +169,13 @@ export async function pollImap() {
     }
     const highest = Math.max(0, Number(client.mailbox.uidNext) - 1);
     if (highest <= checkpoint.uid) {
-      await log('imap_poll', 'success', 'INBOX', { forwarded: 0, lastUid: checkpoint.uid, uidValidity: checkpoint.uidValidity });
       return { forwarded: 0, lastUid: checkpoint.uid };
     }
     const found = await client.search({ uid: `${checkpoint.uid + 1}:${highest}` }, { uid: true });
     const uids = (found || []).filter(uid => uid > checkpoint.uid && uid <= highest).sort((a, b) => a - b).slice(0, BATCH_SIZE);
     let forwarded = 0;
     for (const uid of uids) {
-      if (Date.now() + 20_000 >= deadline) break;
+      if (Date.now() + 8_000 >= deadline) break;
       const meta = await client.fetchOne(uid, { envelope: true, size: true, flags: true }, { uid: true });
       if (meta && !meta.flags?.has('\\Draft')) {
         if (meta.size > MAX_SOURCE) {
@@ -145,11 +204,27 @@ export async function pollImap() {
       checkpoint.uid = highest;
       await setState('imap_checkpoint', JSON.stringify({ uidValidity: checkpoint.uidValidity, uid: highest }));
     }
-    await log('imap_poll', 'success', 'INBOX', { forwarded, lastUid: checkpoint.uid });
     return { forwarded, lastUid: checkpoint.uid, remaining: Math.max(0, highest - checkpoint.uid) };
-  } finally {
-    if (lock) lock.release();
-    client.close();
-    await setState('lock:imap', new Date(0).toISOString());
+}
+
+export async function pollImap() {
+  if (!await claimJob('lock:imap', 90)) return { locked: true };
+  const deadline = Date.now() + RUN_BUDGET_MS;
+  let client, lock, result, failure, uidValidity;
+  try {
+    ({ client, lock } = await openInboxWithRetries());
+    result = await processInbox(client, deadline);
+    uidValidity = String(client.mailbox?.uidValidity || '');
+  } catch (error) { failure = error; }
+  try { await closeInbox(client, lock); }
+  catch (error) { failure ||= error; }
+  try { await setState('lock:imap', new Date(0).toISOString()); }
+  catch (error) { failure ||= error; }
+  if (failure) {
+    await recordPollFailure(failure);
+    return { failed: true, error: errorText(failure) };
   }
+  await setState('imap_failure_streak', 0);
+  await log('imap_poll', 'success', 'INBOX', { ...result, uidValidity });
+  return result;
 }

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { simpleParser } from 'mailparser';
 import { mediaInfo, safeName, stripHtml, truncate } from '../src/core.js';
-import { checkpointFor, messageKey } from '../src/imap.js';
+import { checkpointFor, messageKey, shouldAlert } from '../src/imap.js';
 
 test('HTML fallback strips tags and decodes common entities', () => {
   assert.equal(stripHtml('<p>A &amp; B</p><div>C</div>'), 'A & B\nC');
@@ -28,6 +28,14 @@ test('Message-ID is the deduplication key, with UID fallback only if absent', ()
   assert.equal(messageKey('<one@example.com>', '42', 1), 'mid:one@example.com');
   assert.equal(messageKey('<one@example.com>', '42', 2), 'mid:one@example.com');
   assert.equal(messageKey('', '42', 2), 'uid:42:2');
+});
+
+test('IMAP alert needs three failed polls and a six-hour cooldown', () => {
+  const now = Date.parse('2026-10-12T00:00:00Z');
+  assert.equal(shouldAlert(2, 0, now), false);
+  assert.equal(shouldAlert(3, 0, now), true);
+  assert.equal(shouldAlert(4, now - 5 * 60 * 60 * 1000, now), false);
+  assert.equal(shouldAlert(4, now - 6 * 60 * 60 * 1000, now), true);
 });
 
 test('MIME parser keeps Message-ID, plain body, and attachment filename', async () => {
