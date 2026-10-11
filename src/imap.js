@@ -20,7 +20,10 @@ export function messageKey(messageId, uidValidity, uid) {
 export function checkpointFor(mailbox, saved) {
   const uidValidity = String(mailbox.uidValidity);
   const highest = Math.max(0, Number(mailbox.highestUid || 0));
-  if (!saved || saved.uidValidity !== uidValidity) return { uidValidity, uid: highest, initialized: true };
+  if (!saved) return { uidValidity, uid: highest, initialized: true };
+  if (saved.uidValidity !== uidValidity) {
+    throw new Error(`IMAP UIDVALIDITY changed from ${saved.uidValidity} to ${uidValidity}; checkpoint preserved for reconciliation`);
+  }
   return { uidValidity, uid: Number(saved.uid), initialized: false };
 }
 
@@ -97,8 +100,7 @@ export async function pollImap() {
     lock = await client.getMailboxLock('INBOX', { readOnly: true });
     const savedText = await state('imap_checkpoint');
     const saved = savedText ? JSON.parse(savedText) : null;
-    const latest = !saved || saved.uidValidity !== String(client.mailbox.uidValidity)
-      ? await client.fetchOne('*', { uid: true }) : null;
+    const latest = !saved ? await client.fetchOne('*', { uid: true }) : null;
     const checkpoint = checkpointFor({ ...client.mailbox, highestUid: latest?.uid || 0 }, saved);
     if (checkpoint.initialized) {
       await setState('imap_checkpoint', JSON.stringify({ uidValidity: checkpoint.uidValidity, uid: checkpoint.uid }));
@@ -106,7 +108,10 @@ export async function pollImap() {
       return { initialized: true, lastUid: checkpoint.uid, forwarded: 0 };
     }
     const highest = Math.max(0, Number(client.mailbox.uidNext) - 1);
-    if (highest <= checkpoint.uid) return { forwarded: 0, lastUid: checkpoint.uid };
+    if (highest <= checkpoint.uid) {
+      await log('imap_poll', 'success', 'INBOX', { forwarded: 0, lastUid: checkpoint.uid, uidValidity: checkpoint.uidValidity });
+      return { forwarded: 0, lastUid: checkpoint.uid };
+    }
     const found = await client.search({ uid: `${checkpoint.uid + 1}:${highest}` }, { uid: true });
     const uids = (found || []).filter(uid => uid > checkpoint.uid && uid <= highest).sort((a, b) => a - b).slice(0, BATCH_SIZE);
     let forwarded = 0;

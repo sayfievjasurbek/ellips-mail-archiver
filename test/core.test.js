@@ -18,10 +18,10 @@ test('length and filename boundaries', () => {
   assert.equal(safeName('a/b\\c'), 'a_b_c');
 });
 
-test('IMAP baseline skips existing UIDs and resets on UIDVALIDITY change', () => {
+test('IMAP baseline skips existing UIDs and preserves checkpoint on UIDVALIDITY change', () => {
   assert.deepEqual(checkpointFor({ uidValidity: 42n, highestUid: 51 }, null), { uidValidity: '42', uid: 51, initialized: true });
   assert.deepEqual(checkpointFor({ uidValidity: 42n, highestUid: 55 }, { uidValidity: '42', uid: 51 }), { uidValidity: '42', uid: 51, initialized: false });
-  assert.deepEqual(checkpointFor({ uidValidity: 43n, highestUid: 8 }, { uidValidity: '42', uid: 51 }), { uidValidity: '43', uid: 8, initialized: true });
+  assert.throws(() => checkpointFor({ uidValidity: 43n, highestUid: 8 }, { uidValidity: '42', uid: 51 }), /checkpoint preserved for reconciliation/);
 });
 
 test('Message-ID is the deduplication key, with UID fallback only if absent', () => {
