@@ -12,7 +12,7 @@ const fakeClient = () => {
 
 test('userbot wrapper exposes only read methods', () => {
   const bot = readOnlyUserbot(fakeClient());
-  assert.deepEqual(Object.keys(bot).sort(), ['disconnect', 'downloadMedia', 'getDialogs', 'isUserAuthorized', 'iterMessages']);
+  assert.deepEqual(Object.keys(bot).sort(), ['countMessages', 'disconnect', 'downloadMedia', 'getDialogs', 'isUserAuthorized', 'iterMessages']);
   for (const method of ['sendMessage', 'sendFile', 'forwardMessages', 'editMessage', 'deleteMessages', 'markAsRead', 'invoke', 'getEntity', 'start', 'signIn'])
     assert.equal(bot[method], undefined, method);
 });

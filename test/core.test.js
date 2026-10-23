@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { simpleParser } from 'mailparser';
-import { mediaInfo, safeName, stripHtml, truncate } from '../src/core.js';
+import { Api } from 'telegram';
+import { describeDialogs, mediaInfo, safeName, stripHtml, truncate } from '../src/core.js';
 import { checkpointFor, messageKey, shouldAlert } from '../src/imap.js';
 
 test('HTML fallback strips tags and decodes common entities', () => {
@@ -52,4 +53,17 @@ test('MIME parser keeps Message-ID, plain body, and attachment filename', async 
   assert.equal(parsed.text.trim(), 'Plain body');
   assert.equal(parsed.attachments[0].filename, 'report.pdf');
   assert.equal(parsed.attachments[0].content.toString(), 'PDF');
+});
+test('chat picker lists private, group and channel chats newest first and skips bots, deleted and archived', () => {
+  const dialog = (entity, date, extra = {}) => ({ entity, date, message: { id: date }, ...extra });
+  const list = describeDialogs([
+    dialog(new Api.User({ id: 5n, firstName: 'Ann', lastName: 'Lee' }), 100),
+    dialog(new Api.User({ id: 6n, firstName: 'Bot', bot: true }), 400),
+    dialog(new Api.User({ id: 7n, firstName: 'Gone', deleted: true }), 400),
+    dialog(new Api.Chat({ id: 8n, title: 'Family' }), 300),
+    dialog(new Api.Channel({ id: 9n, title: 'News', broadcast: true }), 200),
+    dialog(new Api.Channel({ id: 10n, title: 'Team', megagroup: true }), 50),
+    dialog(new Api.Channel({ id: 11n, title: 'Old', broadcast: true }), 500, { archived: true })
+  ]);
+  assert.deepEqual(list.map(c => [c.id, c.title, c.type]), [['-8', 'Family', 'group'], ['-1009', 'News', 'channel'], ['5', 'Ann Lee', 'private'], ['-10010', 'Team', 'group']]);
 });

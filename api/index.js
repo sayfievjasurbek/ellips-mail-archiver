@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { google } from 'googleapis';
 import { utils } from 'telegram';
 import { waitUntil } from '@vercel/functions';
-import { db, env, ok, state, setState, log, oauth, oauthScopes, encrypt, pollArchive, telegramBot, userbot } from '../src/core.js';
+import { db, env, ok, state, setState, log, oauth, oauthScopes, encrypt, pollArchive, telegramBot, userbot, describeDialogs } from '../src/core.js';
 import { pollImap } from '../src/imap.js';
 
 const reply = (res, code, body) => res.status(code).json(body);
@@ -85,6 +85,18 @@ export default async function handler(req, res) {
       await setState(`${purpose}_account_email`, account);
       await log('oauth_connect', 'success', account, { purpose });
       return res.status(200).send(`Drive and Sheets connected as ${account}. You can close this tab.`);
+    }
+    if (path === '/api/admin/chats' && req.method === 'GET') {
+      if (!authorized(req, process.env.SETUP_SECRET)) return reply(res, 401, { error: 'Unauthorized' });
+      const client = await userbot();
+      try {
+        const dialogs = await client.getDialogs({ limit: 500 });
+        const count = req.query?.count;
+        if (!count) return reply(res, 200, { chats: describeDialogs(dialogs).map((chat, index) => ({ n: index + 1, ...chat })) });
+        const found = dialogs.find(d => String(utils.getPeerId(d.entity)) === String(count));
+        if (!found) return reply(res, 404, { error: 'Chat not found' });
+        return reply(res, 200, { id: String(count), totalMessages: await client.countMessages(found.entity) });
+      } finally { await client.disconnect(); }
     }
     if (path === '/api/telegram' && req.method === 'POST') return reply(res, 200, await botCommand(req));
     if (path === '/api/poll/archive' && req.method === 'GET') {

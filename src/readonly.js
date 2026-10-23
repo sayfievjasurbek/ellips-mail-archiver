@@ -22,6 +22,7 @@ export function readOnlyUserbot(client) {
     getDialogs: options => client.getDialogs(options),
     iterMessages: (peer, options) => client.iterMessages(peer, options),
     downloadMedia: (media, options) => client.downloadMedia(media, options),
+    countMessages: async peer => (await client.getMessages(peer, { limit: 1 })).total,
     isUserAuthorized: () => client.isUserAuthorized(),
     disconnect: () => client.disconnect()
   });

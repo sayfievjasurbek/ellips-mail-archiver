@@ -71,6 +71,20 @@ export async function userbot() {
   await client.connect(); if (!await client.isUserAuthorized()) throw new Error('Telegram user session expired');
   return readOnlyUserbot(client);
 }
+export function describeDialogs(dialogs) {
+  const kinds = { User: 'private', Chat: 'group' };
+  return dialogs
+    .filter(d => (kinds[d.entity?.className] || d.entity?.className === 'Channel')
+      && !d.archived && !d.entity.bot && !d.entity.deleted && !d.entity.self && !d.entity.deactivated)
+    .map(d => ({
+      id: String(utils.getPeerId(d.entity)),
+      title: d.entity.title || [d.entity.firstName, d.entity.lastName].filter(Boolean).join(' ') || d.entity.username || String(d.entity.id),
+      type: d.entity.className === 'Channel' ? (d.entity.megagroup ? 'group' : 'channel') : kinds[d.entity.className],
+      lastActivity: d.date ? new Date(d.date * 1000).toISOString() : null,
+      lastMessageId: d.message?.id || 0
+    }))
+    .sort((a, b) => String(b.lastActivity).localeCompare(String(a.lastActivity)));
+}
 export function mediaInfo(message) {
   if (!message.media || message.sticker) return null;
   const file = message.file;
