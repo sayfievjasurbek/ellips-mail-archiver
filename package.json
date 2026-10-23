@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "test": "node --test",
-    "check": "node --check api/index.js && node --check src/core.js && node --check src/imap.js && node --check scripts/telegram-login.js"
+    "check": "node --check api/index.js && node --check src/core.js && node --check src/imap.js && node --check src/readonly.js && node --check scripts/telegram-login.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.58.0",

@@ -41,14 +41,12 @@ async function botCommand(req) {
     try {
       client = await userbot();
       const target = args[0];
-      let entity;
-      if (target.startsWith('@')) entity = await client.getEntity(target);
-      else {
-        const dialogs = await client.getDialogs({ limit: 500 });
-        const found = dialogs.find(d => String(utils.getPeerId(d.entity)) === target);
-        if (!found) throw new Error('Chat ID is not in the user account’s recent dialogs. Use @username or open the chat in Telegram first.');
-        entity = found.entity;
-      }
+      const dialogs = await client.getDialogs({ limit: 500 });
+      const found = dialogs.find(d => target.startsWith('@')
+        ? d.entity?.username?.toLowerCase() === target.slice(1).toLowerCase()
+        : String(utils.getPeerId(d.entity)) === target);
+      if (!found) throw new Error('Chat is not among the user account’s existing chats. Only chats the account is already in can be archived.');
+      const entity = found.entity;
       const chatId = String(utils.getPeerId(entity));
       const title = entity.title || [entity.firstName, entity.lastName].filter(Boolean).join(' ') || entity.username || chatId;
       const existing = ok(await db().from('archived_chats').select('chat_id').eq('chat_id', chatId).maybeSingle());

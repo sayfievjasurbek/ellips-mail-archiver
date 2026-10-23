@@ -4,6 +4,7 @@ import { createClient } from '@supabase/supabase-js';
 import { google } from 'googleapis';
 import { TelegramClient, utils } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
+import { readOnlyUserbot } from './readonly.js';
 
 export const oauthScopes = {
   archive: ['https://www.googleapis.com/auth/drive.file', 'https://www.googleapis.com/auth/spreadsheets']
@@ -68,7 +69,7 @@ export async function telegramBot(method, params = {}, file, signal) {
 export async function userbot() {
   const client = new TelegramClient(new StringSession(env('TELEGRAM_STRING_SESSION')), Number(env('TELEGRAM_API_ID')), env('TELEGRAM_API_HASH'), { connectionRetries: 2 });
   await client.connect(); if (!await client.isUserAuthorized()) throw new Error('Telegram user session expired');
-  return client;
+  return readOnlyUserbot(client);
 }
 export function mediaInfo(message) {
   if (!message.media || message.sticker) return null;
@@ -113,7 +114,7 @@ async function ensureResources(auth, chat, deadline) {
   return { drive, sheets, root, folder, spreadsheetId, tab };
 }
 export async function archiveChat(client, auth, chat, dialogs, deadline, limit = 15) {
-  const peer = chat.username ? await client.getEntity(`@${chat.username}`) : dialogs.find(d => String(utils.getPeerId(d.entity)) === chat.chat_id)?.entity;
+  const peer = dialogs.find(d => String(utils.getPeerId(d.entity)) === chat.chat_id)?.entity;
   if (!peer) throw new Error('Chat is not in the user account’s recent dialogs');
   let count = 0, processed = 0, last = Number(chat.last_message_id || 0), paused = false;
   for await (const message of client.iterMessages(peer, { minId: last, reverse: true, limit })) {
