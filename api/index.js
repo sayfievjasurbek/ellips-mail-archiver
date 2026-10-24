@@ -94,7 +94,7 @@ export default async function handler(req, res) {
         if (!count) return reply(res, 200, { chats: describeDialogs(dialogs).map((chat, index) => ({ n: index + 1, ...chat })) });
         const entity = findChatEntity(dialogs, count);
         if (!entity) return reply(res, 404, { error: 'Chat not found' });
-        if (req.query?.scan) return reply(res, 200, { id: String(count), ...await scanMedia(client, entity, Number(req.query.from || 0), Date.now() + 40_000) });
+        if (req.query?.scan) return reply(res, 200, { id: String(count), ...await scanMedia(client, entity, Number(req.query.from || 0), Date.now() + 35_000) });
         return reply(res, 200, { id: String(count), totalMessages: await client.countMessages(entity) });
       } finally { await client.disconnect(); }
     }

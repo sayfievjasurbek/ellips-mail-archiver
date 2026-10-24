@@ -178,14 +178,33 @@ async function appendRow(ctx, row, deadline) {
 }
 const fileRow = (message, sender, info, size, cell, link) => [messageDate(message), sender, info.name, info.kind, size, cell, link];
 
+// Reads a chat oldest-first after minId. Every wait for Telegram is capped by the deadline, so a stalled
+// request ends the run (state.timedOut) instead of freezing the serverless function.
+async function* readMessages(client, peer, minId, deadline, state) {
+  const iterator = client.iterMessages(peer, { minId, reverse: true })[Symbol.asyncIterator]();
+  try {
+    while (true) {
+      const remaining = deadline - Date.now() - 500;
+      if (remaining <= 0) { state.timedOut = true; return; }
+      let timer;
+      const next = await Promise.race([iterator.next(), new Promise(resolve => { timer = setTimeout(() => resolve(null), remaining); })]);
+      clearTimeout(timer);
+      if (next === null) { state.timedOut = true; return; }
+      if (next.done) return;
+      yield next.value;
+    }
+  } finally { iterator.return?.().catch?.(() => {}); }
+}
+
 export async function archiveChat(client, auth, chat, dialogs, deadline) {
   const peer = findChatEntity(dialogs, chat.chat_id);
   if (!peer) throw new Error('Chat is not among the user account’s chats');
   const where = message => `${chat.chat_id}:${message.id}`;
   let count = 0, skipped = 0, processed = 0, last = Number(chat.last_message_id || 0), saved = last, paused = false, ctx;
   const save = async () => { if (last !== saved) { ok(await db().from('archived_chats').update({ last_message_id: last }).eq('chat_id', chat.chat_id)); saved = last; } };
+  const reading = {};
   try {
-    for await (const message of client.iterMessages(peer, { minId: last, reverse: true })) {
+    for await (const message of readMessages(client, peer, last, deadline, reading)) {
       const info = mediaInfo(message);
       if (!info) {
         if (!hasArchiveTime(deadline, 1_000)) { paused = true; break; }
@@ -259,17 +278,18 @@ export async function archiveChat(client, auth, chat, dialogs, deadline) {
     throw error;
   }
   await save();
-  return { archived: count, skipped, processed, lastMessageId: last, paused };
+  return { archived: count, skipped, processed, lastMessageId: last, paused: paused || Boolean(reading.timedOut) };
 }
 // Temporary admin helper: counts files and bytes in a chat without downloading anything.
 export async function scanMedia(client, peer, fromId, deadline) {
   const result = { files: 0, bytes: 0, over50MB: 0, scanned: 0, lastId: fromId, done: true };
-  for await (const message of client.iterMessages(peer, { minId: fromId, reverse: true })) {
-    if (!hasArchiveTime(deadline, 1_000)) { result.done = false; break; }
+  const reading = {};
+  for await (const message of readMessages(client, peer, fromId, deadline, reading)) {
     result.scanned++; result.lastId = message.id;
     const info = mediaInfo(message);
     if (info) { result.files++; result.bytes += info.size; if (info.size > MAX_ARCHIVE_FILE) result.over50MB++; }
   }
+  result.done = !reading.timedOut;
   return result;
 }
 export async function pollArchive({ budgetMs = ARCHIVE_RUN_BUDGET_MS } = {}) {
