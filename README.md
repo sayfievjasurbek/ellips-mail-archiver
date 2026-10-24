@@ -48,4 +48,4 @@ Run `node scripts/telegram-login.js` locally when the client can provide the log
 3. Send a new email with a PDF and image, poll again, and confirm each file appears once in the group. Check `forwarded_emails` and `message_log`.
 4. Add a Telegram chat, poll the archive route, and check Drive and the Sheet. Post a new file and check the next poll.
 
-Each email batch targets 45 seconds within Vercel's 60-second function limit; archive batches target 38 seconds. A `202` means accepted, not completed. A crash after Telegram accepts a send but before the database step is recorded can result in that step being sent again on retry. Large backlogs require multiple polls.
+Each email batch targets 45 seconds within Vercel's 60-second function limit; archive batches target 45 seconds. A `202` means accepted, not completed. A crash after Telegram accepts a send but before the database step is recorded can result in that step being sent again on retry. Large backlogs require multiple polls.

@@ -20,8 +20,10 @@ export const state = async key => (ok(await db().from('app_state').select('value
 export const setState = async (key, value) => ok(await db().from('app_state').upsert({ key, value: String(value), updated_at: new Date().toISOString() }));
 export const log = async (action, status, source_id, details = {}) => ok(await db().from('message_log').insert({ action, status, source_id: String(source_id || ''), details }));
 export const claimJob = async (key, seconds = 600) => ok(await db().rpc('claim_job', { p_key: key, p_seconds: seconds }));
-export const ARCHIVE_RUN_BUDGET_MS = 38_000;
-export const ARCHIVE_MIN_START_MS = 18_000;
+export const ARCHIVE_RUN_BUDGET_MS = 45_000;
+export const ARCHIVE_MIN_START_MS = 8_000;
+// Time a file needs before it is started: fixed overhead plus its size at roughly 3 MB/s, so small files keep flowing until the budget is nearly spent.
+export const fileStartMs = size => 3_000 + Math.min(25_000, Number(size || 0) / 3_000);
 export const hasArchiveTime = (deadline, minimum = 0) => Date.now() + minimum < deadline;
 export function rotateChats(chats, nextChatId) {
   const index = chats.findIndex(chat => chat.chat_id === nextChatId);
@@ -212,7 +214,7 @@ export async function archiveChat(client, auth, chat, dialogs, deadline) {
         if (processed % SAVE_EVERY === 0) await save();
         continue;
       }
-      if (!hasArchiveTime(deadline, ARCHIVE_MIN_START_MS)) { paused = true; break; }
+      if (!hasArchiveTime(deadline, fileStartMs(info.size))) { paused = true; break; }
       const claimed = ok(await db().rpc('claim_file', { p_chat: chat.chat_id, p_message: message.id, p_unique: info.unique }));
       if (!claimed) {
         const existing = ok(await db().from('archived_files').select('status').eq('chat_id', chat.chat_id).eq('message_id', message.id).single());

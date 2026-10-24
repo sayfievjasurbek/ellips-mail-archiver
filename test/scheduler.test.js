@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import handler, { schedulerAuthorized } from '../api/index.js';
-import { ARCHIVE_RUN_BUDGET_MS, hasArchiveTime, oauthScopes, rotateChats } from '../src/core.js';
+import { ARCHIVE_RUN_BUDGET_MS, fileStartMs, hasArchiveTime, oauthScopes, rotateChats } from '../src/core.js';
 
 test('Vercel Hobby has no internal crons', async () => {
   const config = JSON.parse(await readFile(new URL('../vercel.json', import.meta.url)));
@@ -46,4 +46,9 @@ test('only archive consent needs Google scopes', () => {
     'https://www.googleapis.com/auth/drive.file',
     'https://www.googleapis.com/auth/spreadsheets'
   ]);
+});
+test('small files keep starting late in the run, big ones need more time', () => {
+  assert.ok(fileStartMs(2 * 1024 * 1024) < 4_000);
+  assert.ok(fileStartMs(50 * 1024 * 1024) > 15_000);
+  assert.ok(fileStartMs(10 * 1024 ** 3) <= 28_000);
 });
