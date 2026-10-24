@@ -98,8 +98,9 @@ export function describeDialogs(dialogs) {
     }))
     .sort((a, b) => String(b.lastActivity).localeCompare(String(a.lastActivity)));
 }
+const FILE_MEDIA = new Set(['MessageMediaPhoto', 'MessageMediaDocument']);
 export function mediaInfo(message) {
-  if (!message.media || message.sticker) return null;
+  if (!FILE_MEDIA.has(message.media?.className) || message.sticker) return null;
   const file = message.file;
   if (!file) return null;
   const kind = message.photo ? 'photo' : message.video ? 'video' : message.voice ? 'voice' : message.audio ? 'audio' : 'document';
@@ -140,73 +141,136 @@ async function ensureResources(auth, chat, deadline) {
   }
   return { drive, sheets, root, folder, spreadsheetId, tab };
 }
-export async function archiveChat(client, auth, chat, dialogs, deadline, limit = 15) {
+export const displayName = entity => entity
+  ? [entity.firstName, entity.lastName].filter(Boolean).join(' ') || entity.title || entity.username || String(entity.id)
+  : '';
+export const messageDate = message => typeof message.date === 'number' ? new Date(message.date * 1000).toISOString().slice(0, 19).replace('T', ' ') : '';
+export const driveLink = fileId => `https://drive.google.com/file/d/${fileId}/view`;
+export const skippedCell = (reason, messageId) => `ПРОПУЩЕН: ${reason} (сообщение ${messageId})`;
+export const failedCell = (reason, messageId) => `ОШИБКА: ${reason} (сообщение ${messageId})`;
+export const messageLink = (chat, messageId) => chat.username ? `https://t.me/${chat.username}/${messageId}` : chat.chat_id.startsWith('-100') ? `https://t.me/c/${chat.chat_id.slice(4)}/${messageId}` : '';
+const MAX_ARCHIVE_FILE = 50 * 1024 * 1024;
+const FAILURES_BEFORE_GIVING_UP = 3;
+const SAVE_EVERY = 200;
+const escapeSheet = title => title.replace(/'/g, "''");
+
+async function listFolderFiles(drive, folder, deadline) {
+  const files = []; let pageToken;
+  do {
+    const page = (await drive.files.list({ q: `'${folder}' in parents and trashed = false`, fields: 'nextPageToken,files(id,name,description)', pageSize: 1000, ...(pageToken ? { pageToken } : {}) }, googleTimeout(deadline))).data;
+    files.push(...(page.files || [])); pageToken = page.nextPageToken;
+  } while (pageToken);
+  return files;
+}
+// Everything a chat run needs from Drive and Sheets, read once per run instead of once per file.
+async function chatContext(auth, chat, deadline) {
+  const resources = await ensureResources(auth, chat, deadline);
+  const files = await listFolderFiles(resources.drive, resources.folder, deadline);
+  const sheet = (await resources.sheets.spreadsheets.get({ spreadsheetId: resources.spreadsheetId, fields: 'sheets(properties(sheetId,title))' }, googleTimeout(deadline))).data.sheets.find(x => x.properties.sheetId === resources.tab);
+  const range = `'${escapeSheet(sheet.properties.title)}'!A:G`;
+  const rows = (await resources.sheets.spreadsheets.values.get({ spreadsheetId: resources.spreadsheetId, range }, googleTimeout(deadline))).data.values || [];
+  return { ...resources, range, names: new Set(files.map(f => f.name)), byMarker: new Map(files.filter(f => f.description).map(f => [f.description, f])), cells: new Set(rows.map(row => row[5])) };
+}
+async function appendRow(ctx, row, deadline) {
+  if (ctx.cells.has(row[5])) return;
+  await ctx.sheets.spreadsheets.values.append({ spreadsheetId: ctx.spreadsheetId, range: ctx.range, valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS', requestBody: { values: [row] } }, googleTimeout(deadline));
+  ctx.cells.add(row[5]);
+}
+const fileRow = (message, sender, info, size, cell, link) => [messageDate(message), sender, info.name, info.kind, size, cell, link];
+
+export async function archiveChat(client, auth, chat, dialogs, deadline) {
   const peer = findChatEntity(dialogs, chat.chat_id);
-  if (!peer) throw new Error('Chat is not in the user account’s recent dialogs');
-  let count = 0, processed = 0, last = Number(chat.last_message_id || 0), paused = false;
-  for await (const message of client.iterMessages(peer, { minId: last, reverse: true, limit })) {
-    if (!hasArchiveTime(deadline, ARCHIVE_MIN_START_MS)) { paused = true; break; }
-    const info = mediaInfo(message);
-    if (info) {
+  if (!peer) throw new Error('Chat is not among the user account’s chats');
+  const where = message => `${chat.chat_id}:${message.id}`;
+  let count = 0, skipped = 0, processed = 0, last = Number(chat.last_message_id || 0), saved = last, paused = false, ctx;
+  const save = async () => { if (last !== saved) { ok(await db().from('archived_chats').update({ last_message_id: last }).eq('chat_id', chat.chat_id)); saved = last; } };
+  try {
+    for await (const message of client.iterMessages(peer, { minId: last, reverse: true })) {
+      const info = mediaInfo(message);
+      if (!info) {
+        if (!hasArchiveTime(deadline, 1_000)) { paused = true; break; }
+        last = message.id; processed++;
+        if (processed % SAVE_EVERY === 0) await save();
+        continue;
+      }
+      if (!hasArchiveTime(deadline, ARCHIVE_MIN_START_MS)) { paused = true; break; }
       const claimed = ok(await db().rpc('claim_file', { p_chat: chat.chat_id, p_message: message.id, p_unique: info.unique }));
       if (!claimed) {
         const existing = ok(await db().from('archived_files').select('status').eq('chat_id', chat.chat_id).eq('message_id', message.id).single());
         if (existing.status !== 'done' && existing.status !== 'skipped') { paused = true; break; }
-      }
-      if (claimed) {
+      } else {
+        const mark = fields => db().from('archived_files').update(fields).eq('chat_id', chat.chat_id).eq('message_id', message.id);
         try {
-          if (info.size > 50 * 1024 * 1024) {
-            ok(await db().from('archived_files').update({ status: 'skipped', error: 'File exceeds 50 MB serverless processing limit', lease_until: null }).eq('chat_id', chat.chat_id).eq('message_id', message.id));
-            await log('file_archive', 'skipped', `${chat.chat_id}:${message.id}`, { size: info.size });
-            last = message.id; processed++;
-            ok(await db().from('archived_chats').update({ last_message_id: last }).eq('chat_id', chat.chat_id));
-            continue;
-          }
-          const resources = await ensureResources(auth, chat, deadline);
-          const previous = ok(await db().from('archived_files').select('drive_file_id').eq('chat_id', chat.chat_id).eq('message_id', message.id).single());
-          let fileId = previous.drive_file_id, filename = info.name, bytes = info.size;
-          if (!fileId) {
-            const downloaded = await client.downloadMedia(message.media, { progressCallback: () => {
-              if (!hasArchiveTime(deadline, 2_000)) throw new Error('Archive run time budget reached');
-            } });
-            if (!Buffer.isBuffer(downloaded)) throw new Error('Telegram media download failed');
-            bytes = downloaded.length;
-            const q = `'${resources.folder}' in parents and trashed = false`;
-            const existingFiles = (await resources.drive.files.list({ q, fields: 'nextPageToken,files(id,name,description)', pageSize: 1000 }, googleTimeout(deadline))).data.files || [];
-            const earlier = existingFiles.find(f => f.description === `Telegram ${chat.chat_id}:${message.id}`);
-            if (earlier) { fileId = earlier.id; filename = earlier.name; }
-            else {
-              filename = existingFiles.some(f => f.name === info.name) ? `${info.name.replace(/(\.[^.]+)?$/, '')}-${message.id}${info.name.match(/\.[^.]+$/)?.[0] || ''}` : info.name;
-              const upload = await resources.drive.files.create({ requestBody: { name: filename, parents: [resources.folder], description: `Telegram ${chat.chat_id}:${message.id}` }, media: { mimeType: info.mime, body: Readable.from(downloaded) }, fields: 'id' }, googleTimeout(deadline, 30_000));
-              fileId = upload.data.id;
-            }
-            ok(await db().from('archived_files').update({ drive_file_id: fileId }).eq('chat_id', chat.chat_id).eq('message_id', message.id));
+          ctx ||= await chatContext(auth, chat, deadline);
+          let sender = '';
+          try { sender = displayName(await message.getSender()); } catch {}
+          sender ||= message.senderId ? String(message.senderId) : '';
+          const link = messageLink(chat, message.id);
+          if (info.size > MAX_ARCHIVE_FILE) {
+            await appendRow(ctx, fileRow(message, sender, info, info.size, skippedCell('файл больше 50 МБ', message.id), link), deadline);
+            ok(await mark({ status: 'skipped', error: 'File exceeds 50 MB serverless processing limit', lease_until: null }));
+            await log('file_archive', 'skipped', where(message), { size: info.size });
+            skipped++;
           } else {
-            const existing = (await resources.drive.files.get({ fileId, fields: 'id,name,size' }, googleTimeout(deadline))).data;
-            filename = existing.name; bytes = Number(existing.size || bytes);
+            const marker = `Telegram ${where(message)}`;
+            const previous = ok(await db().from('archived_files').select('drive_file_id').eq('chat_id', chat.chat_id).eq('message_id', message.id).single());
+            let fileId = previous.drive_file_id, filename = info.name, bytes = info.size;
+            if (!fileId) {
+              const earlier = ctx.byMarker.get(marker);
+              if (earlier) { fileId = earlier.id; filename = earlier.name; }
+              else {
+                const downloaded = await client.downloadMedia(message.media, { progressCallback: () => {
+                  if (!hasArchiveTime(deadline, 2_000)) throw new Error('Archive run time budget reached');
+                } });
+                if (!Buffer.isBuffer(downloaded)) throw new Error('Telegram media download failed');
+                bytes = downloaded.length;
+                filename = ctx.names.has(info.name) ? `${info.name.replace(/(\.[^.]+)?$/, '')}-${message.id}${info.name.match(/\.[^.]+$/)?.[0] || ''}` : info.name;
+                const upload = await ctx.drive.files.create({ requestBody: { name: filename, parents: [ctx.folder], description: marker }, media: { mimeType: info.mime, body: Readable.from(downloaded) }, fields: 'id' }, googleTimeout(deadline, 30_000));
+                fileId = upload.data.id; ctx.names.add(filename); ctx.byMarker.set(marker, { id: fileId, name: filename });
+              }
+              ok(await mark({ drive_file_id: fileId }));
+            } else {
+              const existing = (await ctx.drive.files.get({ fileId, fields: 'id,name,size' }, googleTimeout(deadline))).data;
+              filename = existing.name; bytes = Number(existing.size || bytes);
+            }
+            await appendRow(ctx, fileRow(message, sender, { ...info, name: filename }, bytes, driveLink(fileId), link), deadline);
+            ok(await mark({ status: 'done', drive_file_id: fileId, archived_at: new Date().toISOString(), lease_until: null }));
+            await log('file_archive', 'success', where(message), { fileId }); count++;
           }
-          const sender = message.senderId ? String(message.senderId) : '';
-          const link = chat.username ? `https://t.me/${chat.username}/${message.id}` : chat.chat_id.startsWith('-100') ? `https://t.me/c/${chat.chat_id.slice(4)}/${message.id}` : '';
-          const sheet = (await resources.sheets.spreadsheets.get({ spreadsheetId: resources.spreadsheetId, fields: 'sheets(properties(sheetId,title))' }, googleTimeout(deadline))).data.sheets.find(s => s.properties.sheetId === resources.tab);
-          const sheetRange = `'${sheet.properties.title.replace(/'/g, "''")}'!A:G`;
-          const existingRows = (await resources.sheets.spreadsheets.values.get({ spreadsheetId: resources.spreadsheetId, range: sheetRange }, googleTimeout(deadline))).data.values || [];
-          if (!existingRows.some(row => row[5] === `https://drive.google.com/file/d/${fileId}/view`)) {
-            await resources.sheets.spreadsheets.values.append({ spreadsheetId: resources.spreadsheetId, range: sheetRange, valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS', requestBody: { values: [[message.date?.toISOString?.() || '', sender, filename, info.kind, bytes, `https://drive.google.com/file/d/${fileId}/view`, link]] } }, googleTimeout(deadline));
-          }
-          ok(await db().from('archived_files').update({ status: 'done', drive_file_id: fileId, archived_at: new Date().toISOString(), lease_until: null }).eq('chat_id', chat.chat_id).eq('message_id', message.id));
-          await log('file_archive', 'success', `${chat.chat_id}:${message.id}`, { fileId }); count++;
         } catch (error) {
-          await db().from('archived_files').update({ status: 'failed', error: String(error), lease_until: null }).eq('chat_id', chat.chat_id).eq('message_id', message.id);
-          await log('file_archive', 'failure', `${chat.chat_id}:${message.id}`, { error: String(error) });
-          throw error;
+          const text = String(error);
+          await mark({ status: 'failed', error: text, lease_until: null });
+          if (/time budget/i.test(text)) { paused = true; break; }
+          await log('file_archive', 'failure', where(message), { error: text });
+          const failures = (await db().from('message_log').select('id', { count: 'exact', head: true }).eq('action', 'file_archive').eq('status', 'failure').eq('source_id', where(message))).count || 0;
+          if (failures < FAILURES_BEFORE_GIVING_UP || !ctx) throw error;
+          let sender = ''; try { sender = displayName(await message.getSender()); } catch {}
+          await appendRow(ctx, fileRow(message, sender || String(message.senderId || ''), info, info.size, failedCell(truncate(text, 150), message.id), messageLink(chat, message.id)), deadline);
+          ok(await mark({ status: 'skipped', error: truncate(text, 500), lease_until: null }));
+          await log('file_archive', 'gave_up', where(message), { error: truncate(text, 300) });
+          skipped++;
         }
       }
+      last = message.id; processed++;
+      await save();
     }
-    last = message.id;
-    processed++;
-    ok(await db().from('archived_chats').update({ last_message_id: last }).eq('chat_id', chat.chat_id));
+  } catch (error) {
+    try { await save(); } catch {}
+    throw error;
   }
-  return { archived: count, processed, lastMessageId: last, paused };
+  await save();
+  return { archived: count, skipped, processed, lastMessageId: last, paused };
+}
+// Temporary admin helper: counts files and bytes in a chat without downloading anything.
+export async function scanMedia(client, peer, fromId, deadline) {
+  const result = { files: 0, bytes: 0, over50MB: 0, scanned: 0, lastId: fromId, done: true };
+  for await (const message of client.iterMessages(peer, { minId: fromId, reverse: true })) {
+    if (!hasArchiveTime(deadline, 1_000)) { result.done = false; break; }
+    result.scanned++; result.lastId = message.id;
+    const info = mediaInfo(message);
+    if (info) { result.files++; result.bytes += info.size; if (info.size > MAX_ARCHIVE_FILE) result.over50MB++; }
+  }
+  return result;
 }
 export async function pollArchive({ budgetMs = ARCHIVE_RUN_BUDGET_MS } = {}) {
   const deadline = Date.now() + budgetMs;

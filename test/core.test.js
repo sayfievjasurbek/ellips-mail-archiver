@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { simpleParser } from 'mailparser';
 import { Api } from 'telegram';
-import { describeDialogs, findChatEntity, getAllDialogs, mediaInfo, safeName, stripHtml, truncate } from '../src/core.js';
+import { describeDialogs, displayName, driveLink, failedCell, findChatEntity, getAllDialogs, mediaInfo, messageDate, messageLink, skippedCell, safeName, stripHtml, truncate } from '../src/core.js';
 import { checkpointFor, messageKey, shouldAlert } from '../src/imap.js';
 
 test('HTML fallback strips tags and decodes common entities', () => {
@@ -10,8 +10,10 @@ test('HTML fallback strips tags and decodes common entities', () => {
 });
 test('media selection excludes stickers and text', () => {
   assert.equal(mediaInfo({ id: 1, message: 'hello' }), null);
-  assert.equal(mediaInfo({ id: 2, media: {}, sticker: true, file: { name: 'sticker.webp' } }), null);
-  assert.deepEqual(mediaInfo({ id: 3, media: { document: { id: 44 } }, file: { name: '../invoice.pdf', size: 100 }, video: false }),
+  assert.equal(mediaInfo({ id: 4, media: { className: 'MessageMediaWebPage' }, file: { name: 'preview.jpg' } }), null);
+  assert.equal(mediaInfo({ id: 5, media: { className: 'MessageMediaPoll' } }), null);
+  assert.equal(mediaInfo({ id: 2, media: { className: 'MessageMediaDocument' }, sticker: true, file: { name: 'sticker.webp' } }), null);
+  assert.deepEqual(mediaInfo({ id: 3, media: { className: 'MessageMediaDocument', document: { id: 44 } }, file: { name: '../invoice.pdf', size: 100 }, video: false }),
     { kind: 'document', name: '.._invoice.pdf', mime: 'application/octet-stream', size: 100, unique: '44' });
 });
 test('length and filename boundaries', () => {
@@ -82,4 +84,19 @@ test('chat lookup pages through all dialogs and finds archived chats and chats b
   assert.equal(all.find(d => String(d.entity.id) === '99').archived, true);
   assert.equal(all.find(d => String(d.entity.id) === '1003').archived, false);
   assert.equal(findChatEntity(all, '5'), undefined);
+});
+test('sheet cells: sender names, dates, links and skipped/failed markers', () => {
+  assert.equal(displayName({ firstName: 'Алибек', lastName: 'Ахмедов', id: 5n }), 'Алибек Ахмедов');
+  assert.equal(displayName({ title: 'НГМК Файлы', id: 6n }), 'НГМК Файлы');
+  assert.equal(displayName({ id: 7n }), '7');
+  assert.equal(displayName(undefined), '');
+  assert.equal(messageDate({ date: 1760000000 }), '2025-10-09 08:53:20');
+  assert.equal(messageDate({}), '');
+  assert.equal(driveLink('abc'), 'https://drive.google.com/file/d/abc/view');
+  assert.equal(messageLink({ chat_id: '-1001234', username: null }, 9), 'https://t.me/c/1234/9');
+  assert.equal(messageLink({ chat_id: '-1001234', username: 'news' }, 9), 'https://t.me/news/9');
+  assert.equal(messageLink({ chat_id: '-5061072539' }, 9), '');
+  assert.equal(messageLink({ chat_id: '55611620' }, 9), '');
+  assert.equal(skippedCell('файл больше 50 МБ', 12), 'ПРОПУЩЕН: файл больше 50 МБ (сообщение 12)');
+  assert.equal(failedCell('timeout', 13), 'ОШИБКА: timeout (сообщение 13)');
 });

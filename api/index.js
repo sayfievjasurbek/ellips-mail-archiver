@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { google } from 'googleapis';
 import { utils } from 'telegram';
 import { waitUntil } from '@vercel/functions';
-import { db, env, ok, state, setState, log, oauth, oauthScopes, encrypt, pollArchive, telegramBot, userbot, describeDialogs, getAllDialogs, findChatEntity } from '../src/core.js';
+import { db, env, ok, state, setState, log, oauth, oauthScopes, encrypt, pollArchive, telegramBot, userbot, describeDialogs, getAllDialogs, findChatEntity, scanMedia } from '../src/core.js';
 import { pollImap } from '../src/imap.js';
 
 const reply = (res, code, body) => res.status(code).json(body);
@@ -94,6 +94,7 @@ export default async function handler(req, res) {
         if (!count) return reply(res, 200, { chats: describeDialogs(dialogs).map((chat, index) => ({ n: index + 1, ...chat })) });
         const entity = findChatEntity(dialogs, count);
         if (!entity) return reply(res, 404, { error: 'Chat not found' });
+        if (req.query?.scan) return reply(res, 200, { id: String(count), ...await scanMedia(client, entity, Number(req.query.from || 0), Date.now() + 40_000) });
         return reply(res, 200, { id: String(count), totalMessages: await client.countMessages(entity) });
       } finally { await client.disconnect(); }
     }

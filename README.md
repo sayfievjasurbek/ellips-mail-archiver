@@ -39,7 +39,7 @@ Each poll establishes one read-only IMAP session for fetching, then sends LOGOUT
 
 ## Telegram archive
 
-Run `node scripts/telegram-login.js` locally when the client can provide the login code and optional two-step password, then set the resulting session only in Vercel. The userbot reads and downloads but never sends, edits, deletes, or marks messages read. The bot handles `/add_chat <id or @username>`, `/remove_chat <id>`, and `/list_chats` for IDs in `TELEGRAM_ADMIN_IDS`. Backfill and new files proceed in small resumable batches. Drive files go into `Telegram Files/<chat>` and rows into the chat's tab in `Telegram Archive`.
+Run `node scripts/telegram-login.js` locally when the client can provide the login code and optional two-step password, then set the resulting session only in Vercel. The userbot reads and downloads but never sends, edits, deletes, or marks messages read. The bot handles `/add_chat <id or @username>`, `/remove_chat <id>`, and `/list_chats` for IDs in `TELEGRAM_ADMIN_IDS`. Backfill and new files proceed in resumable batches that run until the time budget ends; plain messages are skipped without being stored or logged. The Sheet gets one row per file with the sender's name; files over 50 MB, or that fail three times, get a row marked `ПРОПУЩЕН` or `ОШИБКА` with the reason in the Drive-link column. Drive files go into `Telegram Files/<chat>` and rows into the chat's tab in `Telegram Archive`.
 
 ## Checks and limits
 
