@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { simpleParser } from 'mailparser';
 import { Api } from 'telegram';
-import { describeDialogs, mediaInfo, safeName, stripHtml, truncate } from '../src/core.js';
+import { describeDialogs, findChatEntity, getAllDialogs, mediaInfo, safeName, stripHtml, truncate } from '../src/core.js';
 import { checkpointFor, messageKey, shouldAlert } from '../src/imap.js';
 
 test('HTML fallback strips tags and decodes common entities', () => {
@@ -54,16 +54,32 @@ test('MIME parser keeps Message-ID, plain body, and attachment filename', async 
   assert.equal(parsed.attachments[0].filename, 'report.pdf');
   assert.equal(parsed.attachments[0].content.toString(), 'PDF');
 });
-test('chat picker lists private, group and channel chats newest first and skips bots, deleted and archived', () => {
-  const dialog = (entity, date, extra = {}) => ({ entity, date, message: { id: date }, ...extra });
+test('chat picker lists every kind of chat newest first, marks archived, skips bots, deleted and Telegram service chat', () => {
+  const dialog = (entity, date, extra = {}) => ({ entity, date, message: { id: date }, archived: false, ...extra });
   const list = describeDialogs([
     dialog(new Api.User({ id: 5n, firstName: 'Ann', lastName: 'Lee' }), 100),
     dialog(new Api.User({ id: 6n, firstName: 'Bot', bot: true }), 400),
     dialog(new Api.User({ id: 7n, firstName: 'Gone', deleted: true }), 400),
+    dialog(new Api.User({ id: 777000n, firstName: 'Telegram' }), 450),
     dialog(new Api.Chat({ id: 8n, title: 'Family' }), 300),
     dialog(new Api.Channel({ id: 9n, title: 'News', broadcast: true }), 200),
     dialog(new Api.Channel({ id: 10n, title: 'Team', megagroup: true }), 50),
     dialog(new Api.Channel({ id: 11n, title: 'Old', broadcast: true }), 500, { archived: true })
   ]);
-  assert.deepEqual(list.map(c => [c.id, c.title, c.type]), [['-8', 'Family', 'group'], ['-1009', 'News', 'channel'], ['5', 'Ann Lee', 'private'], ['-10010', 'Team', 'group']]);
+  assert.deepEqual(list.map(c => [c.id, c.title, c.type, c.archived]),
+    [['-10011', 'Old', 'channel', true], ['-8', 'Family', 'group', false], ['-1009', 'News', 'channel', false], ['5', 'Ann Lee', 'private', false], ['-10010', 'Team', 'group', false]]);
+});
+test('chat lookup pages through all dialogs and finds archived chats and chats beyond 500', async () => {
+  const active = Array.from({ length: 700 }, (_, i) => ({ entity: new Api.User({ id: BigInt(1000 + i), firstName: `U${i}` }), date: 1, message: { id: 1 } }));
+  const archived = [{ entity: new Api.User({ id: 99n, firstName: 'Hidden' }), date: 1, message: { id: 1 } }, active[3]];
+  const folders = [];
+  const client = { getDialogs: async ({ folder }) => { folders.push(folder); return folder === 1 ? archived : active; } };
+  const all = await getAllDialogs(client);
+  assert.deepEqual(folders, [0, 1]);
+  assert.equal(all.length, 701);
+  assert.equal(findChatEntity(all, '1699').firstName, 'U699');
+  assert.equal(findChatEntity(all, '99').firstName, 'Hidden');
+  assert.equal(all.find(d => String(d.entity.id) === '99').archived, true);
+  assert.equal(all.find(d => String(d.entity.id) === '1003').archived, false);
+  assert.equal(findChatEntity(all, '5'), undefined);
 });

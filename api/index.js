@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { google } from 'googleapis';
 import { utils } from 'telegram';
 import { waitUntil } from '@vercel/functions';
-import { db, env, ok, state, setState, log, oauth, oauthScopes, encrypt, pollArchive, telegramBot, userbot, describeDialogs } from '../src/core.js';
+import { db, env, ok, state, setState, log, oauth, oauthScopes, encrypt, pollArchive, telegramBot, userbot, describeDialogs, getAllDialogs, findChatEntity } from '../src/core.js';
 import { pollImap } from '../src/imap.js';
 
 const reply = (res, code, body) => res.status(code).json(body);
@@ -41,12 +41,11 @@ async function botCommand(req) {
     try {
       client = await userbot();
       const target = args[0];
-      const dialogs = await client.getDialogs({ limit: 500 });
-      const found = dialogs.find(d => target.startsWith('@')
-        ? d.entity?.username?.toLowerCase() === target.slice(1).toLowerCase()
-        : String(utils.getPeerId(d.entity)) === target);
-      if (!found) throw new Error('Chat is not among the user account’s existing chats. Only chats the account is already in can be archived.');
-      const entity = found.entity;
+      const dialogs = await getAllDialogs(client);
+      const entity = target.startsWith('@')
+        ? dialogs.find(d => d.entity?.username?.toLowerCase() === target.slice(1).toLowerCase())?.entity
+        : findChatEntity(dialogs, target);
+      if (!entity) throw new Error('Chat is not among the user account’s existing chats. Only chats the account is already in can be archived.');
       const chatId = String(utils.getPeerId(entity));
       const title = entity.title || [entity.firstName, entity.lastName].filter(Boolean).join(' ') || entity.username || chatId;
       const existing = ok(await db().from('archived_chats').select('chat_id').eq('chat_id', chatId).maybeSingle());
@@ -90,12 +89,12 @@ export default async function handler(req, res) {
       if (!authorized(req, process.env.SETUP_SECRET)) return reply(res, 401, { error: 'Unauthorized' });
       const client = await userbot();
       try {
-        const dialogs = await client.getDialogs({ limit: 500 });
+        const dialogs = await getAllDialogs(client);
         const count = req.query?.count;
         if (!count) return reply(res, 200, { chats: describeDialogs(dialogs).map((chat, index) => ({ n: index + 1, ...chat })) });
-        const found = dialogs.find(d => String(utils.getPeerId(d.entity)) === String(count));
-        if (!found) return reply(res, 404, { error: 'Chat not found' });
-        return reply(res, 200, { id: String(count), totalMessages: await client.countMessages(found.entity) });
+        const entity = findChatEntity(dialogs, count);
+        if (!entity) return reply(res, 404, { error: 'Chat not found' });
+        return reply(res, 200, { id: String(count), totalMessages: await client.countMessages(entity) });
       } finally { await client.disconnect(); }
     }
     if (path === '/api/telegram' && req.method === 'POST') return reply(res, 200, await botCommand(req));

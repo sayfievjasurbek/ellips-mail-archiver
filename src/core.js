@@ -71,15 +71,28 @@ export async function userbot() {
   await client.connect(); if (!await client.isUserAuthorized()) throw new Error('Telegram user session expired');
   return readOnlyUserbot(client);
 }
+const peerId = entity => String(utils.getPeerId(entity));
+// Every dialog of the account, main folder first, then the Archived folder (paged by gramjs, no cap).
+export async function getAllDialogs(client) {
+  const active = await client.getDialogs({ folder: 0 });
+  const archived = await client.getDialogs({ folder: 1 });
+  const seen = new Set(active.map(d => peerId(d.entity)));
+  return [
+    ...active.map(d => ({ entity: d.entity, date: d.date, message: d.message, archived: false })),
+    ...archived.filter(d => !seen.has(peerId(d.entity))).map(d => ({ entity: d.entity, date: d.date, message: d.message, archived: true }))
+  ];
+}
+export const findChatEntity = (dialogs, chatId) => dialogs.find(d => peerId(d.entity) === String(chatId))?.entity;
 export function describeDialogs(dialogs) {
   const kinds = { User: 'private', Chat: 'group' };
   return dialogs
     .filter(d => (kinds[d.entity?.className] || d.entity?.className === 'Channel')
-      && !d.archived && !d.entity.bot && !d.entity.deleted && !d.entity.self && !d.entity.deactivated)
+      && !d.entity.bot && !d.entity.deleted && !d.entity.self && !d.entity.deactivated && String(d.entity.id) !== '777000')
     .map(d => ({
-      id: String(utils.getPeerId(d.entity)),
+      id: peerId(d.entity),
       title: d.entity.title || [d.entity.firstName, d.entity.lastName].filter(Boolean).join(' ') || d.entity.username || String(d.entity.id),
       type: d.entity.className === 'Channel' ? (d.entity.megagroup ? 'group' : 'channel') : kinds[d.entity.className],
+      archived: Boolean(d.archived),
       lastActivity: d.date ? new Date(d.date * 1000).toISOString() : null,
       lastMessageId: d.message?.id || 0
     }))
@@ -128,7 +141,7 @@ async function ensureResources(auth, chat, deadline) {
   return { drive, sheets, root, folder, spreadsheetId, tab };
 }
 export async function archiveChat(client, auth, chat, dialogs, deadline, limit = 15) {
-  const peer = dialogs.find(d => String(utils.getPeerId(d.entity)) === chat.chat_id)?.entity;
+  const peer = findChatEntity(dialogs, chat.chat_id);
   if (!peer) throw new Error('Chat is not in the user account’s recent dialogs');
   let count = 0, processed = 0, last = Number(chat.last_message_id || 0), paused = false;
   for await (const message of client.iterMessages(peer, { minId: last, reverse: true, limit })) {
@@ -203,7 +216,7 @@ export async function pollArchive({ budgetMs = ARCHIVE_RUN_BUDGET_MS } = {}) {
     const chats = ok(await db().from('archived_chats').select('*').eq('active', true).order('added_at'));
     if (!chats.length) return { chats: 0 };
     client = await userbot(); const auth = await googleAuth('archive'); const results = [];
-    const dialogs = await client.getDialogs({ limit: 500 });
+    const dialogs = await getAllDialogs(client);
     const ordered = rotateChats(chats, await state('archive_next_chat_id'));
     for (const [index, chat] of ordered.entries()) {
       if (!hasArchiveTime(deadline, ARCHIVE_MIN_START_MS)) break;
